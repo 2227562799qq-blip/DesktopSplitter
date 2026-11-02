@@ -1,25 +1,36 @@
-# DesktopSplitter cloud build driver v3 (lives outside .github/workflows so
+# DesktopSplitter cloud build driver v5 (lives outside .github/workflows so
 # it can be updated without editing the workflow file).
-# Logging: transcript -> ci-log.txt. After the standalone driver build the
-# transcript is stopped, the driver build output is appended, and the
-# transcript resumes in append mode - so the driver errors always land in
-# the committed log even when build.ps1 throws later.
-# The workflow commits ci-log.txt to the ci-logs branch after every run.
+# Mirrors build.ps1 step by step, but every native build runs with output
+# redirected to logs\<step>.log, the driver catalog signature is checked
+# (and fixed with the repo's own installer\sign-dev.ps1 when unsigned),
+# and log tails are appended to ci-log.txt, which the workflow commits
+# to the ci-logs branch after every run.
 $ErrorActionPreference = 'Continue'
 
 $logPath = Join-Path $PWD 'ci-log.txt'
+New-Item -ItemType Directory -Path (Join-Path $PWD 'logs') -Force | Out-Null
 try { Start-Transcript -Path $logPath -Force | Out-Null } catch { }
 
 function Section([string]$t) { Write-Host "`n########## $t ##########" }
 
+function Invoke-Logged([string]$Name, [string]$Exe, [string[]]$Args) {
+    $out = Join-Path $PWD "logs\$Name.log"
+    $err = Join-Path $PWD "logs\$Name.err"
+    Write-Host ">> $Name : $Exe $($Args -join ' ')"
+    $p = Start-Process -FilePath $Exe -Wait -PassThru -NoNewWindow `
+        -RedirectStandardOutput $out -RedirectStandardError $err `
+        -ArgumentList $Args
+    Write-Host "<< $Name exit code: $($p.ExitCode)"
+    return $p.ExitCode
+}
+
 Section 'ENVIRONMENT'
 Write-Host "PSVersion: $($PSVersionTable.PSVersion)"
 Write-Host "OS: $([Environment]::OSVersion.VersionString)"
+Write-Host "Elevated: $(([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator))"
 $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
 if (Test-Path $vswhere) { & $vswhere -all -products * -format json } else { Write-Host 'vswhere NOT FOUND' }
 if (Get-Command dotnet -ErrorAction SilentlyContinue) { dotnet --list-sdks } else { Write-Host 'dotnet NOT FOUND' }
-Write-Host 'Windows Kits Include dirs:'
-Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\Include" -Directory -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "  $($_.Name)" }
 
 Section 'INSTALL WINDOWS SDK 10.0.26100 (if missing)'
 if (Test-Path "${env:ProgramFiles(x86)}\Windows Kits\10\Include\10.0.26100.0") {
@@ -33,85 +44,142 @@ Section 'INSTALL WDK 10.0.26100'
 winget install --id Microsoft.WindowsWDK.10.0.26100 --exact --accept-source-agreements --accept-package-agreements --disable-interactivity
 Write-Host "winget WDK exit code: $LASTEXITCODE"
 
-Section 'WDK BUILD TASKS DLLS PRESENT'
-Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\build\*\bin\Microsoft.DriverKit.Build.Tasks.*.dll" -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "  $($_.FullName)" }
-
 Section 'ADD WDK COMPONENT TO VISUAL STUDIO'
 $vs = $null
 if (Test-Path $vswhere) { $vs = & $vswhere -latest -requires Microsoft.Component.MSBuild -property installationPath | Select-Object -First 1 }
 Write-Host "VS path: $vs"
 if ($vs) {
-    $setupExe = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\setup.exe"
-    $p = Start-Process -FilePath $setupExe -Wait -PassThru -ArgumentList 'modify', '--installPath', "`"$vs`"", '--add', 'Component.Microsoft.Windows.DriverKit', '--quiet', '--norestart'
+    $setupExeVs = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\setup.exe"
+    $p = Start-Process -FilePath $setupExeVs -Wait -PassThru -ArgumentList 'modify', '--installPath', "`"$vs`"", '--add', 'Component.Microsoft.Windows.DriverKit', '--quiet', '--norestart'
     Write-Host "VS modify exit code: $($p.ExitCode)"
-    Write-Host 'Platform toolsets now present:'
-    Get-ChildItem "$vs\MSBuild\Microsoft\VC\*\Platforms\x64\PlatformToolsets\*" -Directory -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "  $($_.Name)" }
-    Write-Host 'MSVC versions + Spectre libs:'
-    Get-ChildItem "$vs\VC\Tools\MSVC" -Directory -ErrorAction SilentlyContinue | ForEach-Object {
-        $spectre = Test-Path (Join-Path $_.FullName 'lib\spectre\x64')
-        Write-Host "  MSVC $($_.Name) spectre-x64-libs: $spectre"
-    }
-} else {
-    Write-Host 'No VS installation found!'
-}
+} else { Write-Host 'No VS installation found!' }
 
-Section 'DRIVER BUILD (standalone, full log captured)'
 $msbuild = $null
 if (Test-Path $vswhere) {
     $msbuild = & $vswhere -latest -requires Microsoft.Component.MSBuild -find 'MSBuild\**\Bin\amd64\MSBuild.exe' | Select-Object -First 1
     if (-not $msbuild) { $msbuild = & $vswhere -latest -requires Microsoft.Component.MSBuild -find 'MSBuild\**\Bin\MSBuild.exe' | Select-Object -First 1 }
 }
 Write-Host "msbuild: $msbuild"
-$driverExit = $null
-if ($msbuild) {
-    $dp = Start-Process -FilePath $msbuild -Wait -PassThru -NoNewWindow `
-        -RedirectStandardOutput 'driver-build.log' -RedirectStandardError 'driver-build.err' `
-        -ArgumentList 'driver\DesktopSplitterVdd.vcxproj', '/p:Configuration=Release', '/p:Platform=x64', '/p:Inf2CatUseLocalTime=true', '/v:n', '/nologo'
-    $driverExit = $dp.ExitCode
-    Write-Host "driver standalone exit code: $driverExit"
-    Write-Host 'driver package dir:'
-    Get-ChildItem 'driver\x64\Release\DesktopSplitterVdd' -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "  $($_.Name) $($_.Length)" }
-} else {
-    Write-Host 'msbuild NOT FOUND'
+if (-not $msbuild) { try { Stop-Transcript | Out-Null } catch { }; exit 1 }
+
+Section 'GENERATE VERSION FILES (same as build.ps1, NoVersionBump)'
+$versionLine = Get-Content .\VERSION | Where-Object { $_.Trim() -ne '' -and -not $_.TrimStart().StartsWith('#') } | Select-Object -Last 1
+$version = $versionLine.Trim()
+$vp = $version.Split('.'); $vMajor = [int]$vp[0]; $vMinor = [int]$vp[1]; $vPatch = [int]$vp[2]
+Write-Host "version: $version"
+$genDir = Join-Path $PWD 'build\generated'
+New-Item -ItemType Directory -Path $genDir -Force | Out-Null
+$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+function Write-Gen([string]$Path, [string]$Content, [switch]$NoTrailingNewline) {
+    if (-not $NoTrailingNewline -and -not $Content.EndsWith("`n")) { $Content += "`r`n" }
+    [System.IO.File]::WriteAllText($Path, $Content, $utf8NoBom)
+}
+Write-Gen (Join-Path $genDir 'Version.props') @"
+<?xml version="1.0" encoding="utf-8"?>
+<!-- GENERATED by ci/build.ps1 from the root VERSION file. Do not edit. -->
+<Project>
+  <PropertyGroup>
+    <DeskSplitVersion>$version</DeskSplitVersion>
+    <DeskSplitVersionMajor>$vMajor</DeskSplitVersionMajor>
+    <DeskSplitVersionMinor>$vMinor</DeskSplitVersionMinor>
+    <DeskSplitVersionPatch>$vPatch</DeskSplitVersionPatch>
+  </PropertyGroup>
+</Project>
+"@
+Write-Gen (Join-Path $genDir 'Version.h') @"
+/* GENERATED by ci/build.ps1 from the root VERSION file. Do not edit. */
+#ifndef DESKSPLIT_VERSION_H
+#define DESKSPLIT_VERSION_H
+
+#define DS_VERSION_MAJOR $vMajor
+#define DS_VERSION_MINOR $vMinor
+#define DS_VERSION_PATCH $vPatch
+
+#define DS_VERSION_STR   "$version"
+#define DS_VERSION_WSTR  L"$version"
+
+/* For VERSIONINFO FILEVERSION / PRODUCTVERSION (4 parts). */
+#define DS_VERSION_COMMA $vMajor,$vMinor,$vPatch,0
+#define DS_VERSION_STR4  "$version.0"
+
+#endif /* DESKSPLIT_VERSION_H */
+"@
+Write-Gen (Join-Path $genDir 'version.txt') $version -NoTrailingNewline
+
+$failAt = $null
+
+Section 'BUILD compositor'
+if (-not $failAt) { if ((Invoke-Logged 'compositor' $msbuild @('compositor\dscomp.vcxproj','/p:Configuration=Release','/p:Platform=x64','/v:m','/nologo')) -ne 0) { $failAt = 'compositor' } }
+
+Section 'BUILD devcreate'
+if (-not $failAt) { if ((Invoke-Logged 'devcreate' $msbuild @('installer\devcreate\devcreate.vcxproj','/p:Configuration=Release','/p:Platform=x64','/v:m','/nologo')) -ne 0) { $failAt = 'devcreate' } }
+
+Section 'BUILD edidoverride'
+if (-not $failAt) { if ((Invoke-Logged 'edidoverride' $msbuild @('installer\edid-override\edidoverride.vcxproj','/p:Configuration=Release','/p:Platform=x64','/v:m','/nologo')) -ne 0) { $failAt = 'edidoverride' } }
+
+Section 'BUILD app (dotnet)'
+if (-not $failAt) { if ((Invoke-Logged 'app' 'dotnet' @('build','app\DesktopSplitter.csproj','-c','Release','--nologo')) -ne 0) { $failAt = 'app' } }
+
+Section 'BUILD driver'
+if (-not $failAt) { if ((Invoke-Logged 'driver' $msbuild @('driver\DesktopSplitterVdd.vcxproj','/p:Configuration=Release','/p:Platform=x64','/p:Inf2CatUseLocalTime=true','/v:m','/nologo')) -ne 0) { $failAt = 'driver' } }
+
+Section 'DRIVER CATALOG SIGNATURE'
+$pkgDir = Join-Path $PWD 'driver\x64\Release\DesktopSplitterVdd'
+Get-ChildItem $pkgDir -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "  $($_.Name) $($_.Length)" }
+$catPath = Join-Path $pkgDir 'desktopsplittervdd.cat'
+if (-not $failAt) {
+    $sig = Get-AuthenticodeSignature $catPath
+    Write-Host "catalog signature status: $($sig.Status)"
+    if ($sig.SignerCertificate) { Write-Host "signer: $($sig.SignerCertificate.Subject)" }
+    if ($sig.Status -eq 'NotSigned' -or -not $sig.SignerCertificate) {
+        Write-Host 'Catalog is UNSIGNED - running repo installer\sign-dev.ps1 (dev cert)...'
+        try {
+            & .\installer\sign-dev.ps1 *>&1 | Tee-Object -FilePath (Join-Path $PWD 'logs\sign-dev.log')
+            Write-Host "sign-dev completed"
+        } catch {
+            Write-Host "sign-dev threw: $($_.Exception.Message)"
+        }
+        $sig2 = Get-AuthenticodeSignature $catPath
+        Write-Host "catalog signature after sign-dev: $($sig2.Status)"
+        if ($sig2.SignerCertificate) { Write-Host "signer: $($sig2.SignerCertificate.Subject)" }
+        if (-not $sig2.SignerCertificate) { $failAt = 'sign-dev' }
+    }
 }
 
-# --- flush driver build output into the committed log, no matter what ---
-try { Stop-Transcript | Out-Null } catch { }
-try {
-    Add-Content -Path $logPath -Value "`n########## DRIVER BUILD LOG (stdout, last 600 lines) ##########"
-    if (Test-Path 'driver-build.log') { Get-Content 'driver-build.log' -Tail 600 | Add-Content -Path $logPath }
-    Add-Content -Path $logPath -Value "`n########## DRIVER BUILD LOG (stderr, last 200 lines) ##########"
-    if (Test-Path 'driver-build.err') { Get-Content 'driver-build.err' -Tail 200 | Add-Content -Path $logPath }
-} catch { }
-try { Start-Transcript -Path $logPath -Append | Out-Null } catch { }
+Section 'BUILD setup (DesktopSplitterSetup)'
+if (-not $failAt) { if ((Invoke-Logged 'setup' $msbuild @('installer\setup\DesktopSplitterSetup.vcxproj','/p:Configuration=Release','/p:Platform=x64','/v:m','/nologo')) -ne 0) { $failAt = 'setup' } }
 
+Section 'RESULT'
 $finalExit = 1
-if ($driverExit -ne 0) {
-    Section 'SKIP build.ps1 (driver already failed standalone)'
-    Write-Host "driver standalone exit code: $driverExit - see DRIVER BUILD LOG above."
+$setupExe = 'installer\setup\bin\x64\Release\DesktopSplitterSetup.exe'
+if (-not $failAt -and (Test-Path $setupExe)) {
+    $named = "DesktopSplitterSetup-$version.exe"
+    Copy-Item $setupExe $named -Force
+    Write-Host "Setup exe ready: $named ($([math]::Round((Get-Item $named).Length/1MB,1)) MB)"
+    & ".\$named" /verify | Write-Host
+    Write-Host "verify exit code: $LASTEXITCODE"
+    if ($LASTEXITCODE -eq 0) { $finalExit = 0 }
 } else {
-    Section 'BUILD (build.ps1, Release, NoVersionBump)'
-    try {
-        & .\build.ps1 -Configuration Release -NoVersionBump
-        Write-Host "build.ps1 exit code: $LASTEXITCODE"
-    } catch {
-        Write-Host "build.ps1 threw: $($_.Exception.Message)"
-    }
-
-    Section 'RESULT'
-    $setupExe = 'installer\setup\bin\x64\Release\DesktopSplitterSetup.exe'
-    if (Test-Path $setupExe) {
-        $version = (Get-Content .\build\generated\version.txt -Raw).Trim()
-        $named = "DesktopSplitterSetup-$version.exe"
-        Copy-Item $setupExe $named -Force
-        Write-Host "Setup exe ready: $named ($([math]::Round((Get-Item $named).Length/1MB,1)) MB)"
-        & ".\$named" /verify | Write-Host
-        Write-Host "verify exit code: $LASTEXITCODE"
-        if ($LASTEXITCODE -eq 0) { $finalExit = 0 }
-    } else {
-        Write-Host 'Setup exe NOT produced.'
-    }
+    Write-Host "FAILED at step: $failAt"
+    Write-Host 'Setup exe NOT produced.'
 }
 
 try { Stop-Transcript | Out-Null } catch { }
+
+# Append per-step log tails to the committed log.
+try {
+    foreach ($name in @('compositor','devcreate','edidoverride','app','driver','sign-dev','setup')) {
+        $f = Join-Path $PWD "logs\$name.log"
+        if (Test-Path $f) {
+            Add-Content -Path $logPath -Value "`n########## STEP LOG: $name (last 300 lines) ##########"
+            Get-Content $f -Tail 300 | Add-Content -Path $logPath
+        }
+        $fe = Join-Path $PWD "logs\$name.err"
+        if ((Test-Path $fe) -and (Get-Item $fe).Length -gt 0) {
+            Add-Content -Path $logPath -Value "`n########## STEP LOG: $name STDERR (last 100 lines) ##########"
+            Get-Content $fe -Tail 100 | Add-Content -Path $logPath
+        }
+    }
+} catch { }
+
 exit $finalExit
