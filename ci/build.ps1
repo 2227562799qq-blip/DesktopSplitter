@@ -13,15 +13,25 @@ try { Start-Transcript -Path $logPath -Force | Out-Null } catch { }
 
 function Section([string]$t) { Write-Host "`n########## $t ##########" }
 
+# NOTE: do NOT wrap builds in Start-Process -Wait with redirected streams:
+# dotnet/msbuild leave build-server processes alive that inherit the
+# redirected handles, and Start-Process -Wait then hangs forever (v6 bug).
+# Direct invocation + Tee returns when the direct process exits.
+$env:MSBUILDDISABLENODEREUSE = '1'
 function Invoke-Logged([string]$Name, [string]$Exe, [string[]]$ArgList) {
     $out = Join-Path $PWD "logs\$Name.log"
-    $err = Join-Path $PWD "logs\$Name.err"
     Write-Host ">> $Name : $Exe $($ArgList -join ' ')"
-    $p = Start-Process -FilePath $Exe -Wait -PassThru -NoNewWindow `
-        -RedirectStandardOutput $out -RedirectStandardError $err `
-        -ArgumentList $ArgList
-    Write-Host "<< $Name exit code: $($p.ExitCode)"
-    return $p.ExitCode
+    try {
+        & $Exe @ArgList *>&1 | Tee-Object -FilePath $out | Out-Null
+        $code = $LASTEXITCODE
+    } catch {
+        $code = 1
+        Write-Host "!! $Name threw: $($_.Exception.Message)"
+        Add-Content -Path $out -Value "threw: $($_.Exception.Message)"
+    }
+    if ($null -eq $code) { $code = 0 }
+    Write-Host "<< $Name exit code: $code"
+    return $code
 }
 
 Section 'ENVIRONMENT'
@@ -32,17 +42,39 @@ $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.e
 if (Test-Path $vswhere) { & $vswhere -all -products * -format json } else { Write-Host 'vswhere NOT FOUND' }
 if (Get-Command dotnet -ErrorAction SilentlyContinue) { dotnet --list-sdks } else { Write-Host 'dotnet NOT FOUND' }
 
+function Get-Winget {
+    $w = Get-Command winget -ErrorAction SilentlyContinue
+    if ($w) { return $w.Source }
+    $candidate = Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps\winget.exe'
+    if (Test-Path $candidate) { return $candidate }
+    $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' + [Environment]::GetEnvironmentVariable('Path', 'User')
+    $w = Get-Command winget -ErrorAction SilentlyContinue
+    if ($w) { return $w.Source }
+    return $null
+}
+$winget = Get-Winget
+Write-Host "winget: $winget"
+
 Section 'INSTALL WINDOWS SDK 10.0.26100 (if missing)'
 if (Test-Path "${env:ProgramFiles(x86)}\Windows Kits\10\Include\10.0.26100.0") {
     Write-Host 'SDK 26100 already present, skipping'
-} else {
-    winget install --id Microsoft.WindowsSDK.10.0.26100 --exact --accept-source-agreements --accept-package-agreements --disable-interactivity
+} elseif ($winget) {
+    & $winget install --id Microsoft.WindowsSDK.10.0.26100 --exact --accept-source-agreements --accept-package-agreements --disable-interactivity
     Write-Host "winget SDK exit code: $LASTEXITCODE"
+} else {
+    Write-Host 'winget NOT FOUND - cannot install SDK (will fail later if truly missing)'
 }
 
-Section 'INSTALL WDK 10.0.26100'
-winget install --id Microsoft.WindowsWDK.10.0.26100 --exact --accept-source-agreements --accept-package-agreements --disable-interactivity
-Write-Host "winget WDK exit code: $LASTEXITCODE"
+Section 'INSTALL WDK 10.0.26100 (if IddCx missing)'
+$iddcxPresent = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\Include\*\um\iddcx\*\IddCx.h" -ErrorAction SilentlyContinue
+if ($iddcxPresent) {
+    Write-Host 'IddCx headers already present, skipping WDK install'
+} elseif ($winget) {
+    & $winget install --id Microsoft.WindowsWDK.10.0.26100 --exact --accept-source-agreements --accept-package-agreements --disable-interactivity
+    Write-Host "winget WDK exit code: $LASTEXITCODE"
+} else {
+    Write-Host 'winget NOT FOUND - cannot install WDK (will fail later if truly missing)'
+}
 
 Section 'ADD WDK COMPONENT TO VISUAL STUDIO'
 $vs = $null
@@ -118,7 +150,7 @@ Section 'BUILD edidoverride'
 if (-not $failAt) { if ((Invoke-Logged 'edidoverride' $msbuild @('installer\edid-override\edidoverride.vcxproj','/p:Configuration=Release','/p:Platform=x64','/v:m','/nologo')) -ne 0) { $failAt = 'edidoverride' } }
 
 Section 'BUILD app (dotnet)'
-if (-not $failAt) { if ((Invoke-Logged 'app' 'dotnet' @('build','app\DesktopSplitter.csproj','-c','Release','--nologo')) -ne 0) { $failAt = 'app' } }
+if (-not $failAt) { if ((Invoke-Logged 'app' 'dotnet' @('build','app\DesktopSplitter.csproj','-c','Release','--nologo','--disable-build-servers')) -ne 0) { $failAt = 'app' } }
 
 Section 'BUILD driver'
 if (-not $failAt) { if ((Invoke-Logged 'driver' $msbuild @('driver\DesktopSplitterVdd.vcxproj','/p:Configuration=Release','/p:Platform=x64','/p:Inf2CatUseLocalTime=true','/v:m','/nologo')) -ne 0) { $failAt = 'driver' } }
