@@ -13,13 +13,13 @@ try { Start-Transcript -Path $logPath -Force | Out-Null } catch { }
 
 function Section([string]$t) { Write-Host "`n########## $t ##########" }
 
-function Invoke-Logged([string]$Name, [string]$Exe, [string[]]$Args) {
+function Invoke-Logged([string]$Name, [string]$Exe, [string[]]$ArgList) {
     $out = Join-Path $PWD "logs\$Name.log"
     $err = Join-Path $PWD "logs\$Name.err"
-    Write-Host ">> $Name : $Exe $($Args -join ' ')"
+    Write-Host ">> $Name : $Exe $($ArgList -join ' ')"
     $p = Start-Process -FilePath $Exe -Wait -PassThru -NoNewWindow `
         -RedirectStandardOutput $out -RedirectStandardError $err `
-        -ArgumentList $Args
+        -ArgumentList $ArgList
     Write-Host "<< $Name exit code: $($p.ExitCode)"
     return $p.ExitCode
 }
