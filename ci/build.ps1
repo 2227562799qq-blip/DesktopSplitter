@@ -33,6 +33,9 @@ Section 'INSTALL WDK 10.0.26100'
 winget install --id Microsoft.WindowsWDK.10.0.26100 --exact --accept-source-agreements --accept-package-agreements --disable-interactivity
 Write-Host "winget WDK exit code: $LASTEXITCODE"
 
+Section 'WDK BUILD TASKS DLLS PRESENT'
+Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\build\*\bin\Microsoft.DriverKit.Build.Tasks.*.dll" -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "  $($_.FullName)" }
+
 Section 'ADD WDK COMPONENT TO VISUAL STUDIO'
 $vs = $null
 if (Test-Path $vswhere) { $vs = & $vswhere -latest -requires Microsoft.Component.MSBuild -property installationPath | Select-Object -First 1 }
