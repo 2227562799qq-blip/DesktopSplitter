@@ -1,11 +1,14 @@
-# DesktopSplitter cloud build driver v2 (lives outside .github/workflows so
+# DesktopSplitter cloud build driver v3 (lives outside .github/workflows so
 # it can be updated without editing the workflow file).
-# Log: transcript -> ci-log.txt, plus the standalone driver build log is
-# appended after the transcript stops. The workflow commits ci-log.txt to
-# the ci-logs branch after every run, success or failure.
+# Logging: transcript -> ci-log.txt. After the standalone driver build the
+# transcript is stopped, the driver build output is appended, and the
+# transcript resumes in append mode - so the driver errors always land in
+# the committed log even when build.ps1 throws later.
+# The workflow commits ci-log.txt to the ci-logs branch after every run.
 $ErrorActionPreference = 'Continue'
 
-try { Start-Transcript -Path (Join-Path $PWD 'ci-log.txt') -Force | Out-Null } catch { }
+$logPath = Join-Path $PWD 'ci-log.txt'
+try { Start-Transcript -Path $logPath -Force | Out-Null } catch { }
 
 function Section([string]$t) { Write-Host "`n########## $t ##########" }
 
@@ -29,7 +32,6 @@ if (Test-Path "${env:ProgramFiles(x86)}\Windows Kits\10\Include\10.0.26100.0") {
 Section 'INSTALL WDK 10.0.26100'
 winget install --id Microsoft.WindowsWDK.10.0.26100 --exact --accept-source-agreements --accept-package-agreements --disable-interactivity
 Write-Host "winget WDK exit code: $LASTEXITCODE"
-Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\Include\*\um\iddcx\*\IddCx.h" -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "IddCx: $($_.FullName)" }
 
 Section 'ADD WDK COMPONENT TO VISUAL STUDIO'
 $vs = $null
@@ -70,34 +72,43 @@ if ($msbuild) {
     Write-Host 'msbuild NOT FOUND'
 }
 
-Section 'BUILD (build.ps1, Release, NoVersionBump)'
-& .\build.ps1 -Configuration Release -NoVersionBump
-$buildExit = $LASTEXITCODE
-Write-Host "build.ps1 exit code: $buildExit"
+# --- flush driver build output into the committed log, no matter what ---
+try { Stop-Transcript | Out-Null } catch { }
+try {
+    Add-Content -Path $logPath -Value "`n########## DRIVER BUILD LOG (stdout, last 600 lines) ##########"
+    if (Test-Path 'driver-build.log') { Get-Content 'driver-build.log' -Tail 600 | Add-Content -Path $logPath }
+    Add-Content -Path $logPath -Value "`n########## DRIVER BUILD LOG (stderr, last 200 lines) ##########"
+    if (Test-Path 'driver-build.err') { Get-Content 'driver-build.err' -Tail 200 | Add-Content -Path $logPath }
+} catch { }
+try { Start-Transcript -Path $logPath -Append | Out-Null } catch { }
 
-Section 'RESULT'
-$setupExe = 'installer\setup\bin\x64\Release\DesktopSplitterSetup.exe'
 $finalExit = 1
-if (Test-Path $setupExe) {
-    $version = (Get-Content .\build\generated\version.txt -Raw).Trim()
-    $named = "DesktopSplitterSetup-$version.exe"
-    Copy-Item $setupExe $named -Force
-    Write-Host "Setup exe ready: $named ($([math]::Round((Get-Item $named).Length/1MB,1)) MB)"
-    & ".\$named" /verify | Write-Host
-    Write-Host "verify exit code: $LASTEXITCODE"
-    if ($LASTEXITCODE -eq 0) { $finalExit = 0 }
+if ($driverExit -ne 0) {
+    Section 'SKIP build.ps1 (driver already failed standalone)'
+    Write-Host "driver standalone exit code: $driverExit - see DRIVER BUILD LOG above."
 } else {
-    Write-Host 'Setup exe NOT produced.'
+    Section 'BUILD (build.ps1, Release, NoVersionBump)'
+    try {
+        & .\build.ps1 -Configuration Release -NoVersionBump
+        Write-Host "build.ps1 exit code: $LASTEXITCODE"
+    } catch {
+        Write-Host "build.ps1 threw: $($_.Exception.Message)"
+    }
+
+    Section 'RESULT'
+    $setupExe = 'installer\setup\bin\x64\Release\DesktopSplitterSetup.exe'
+    if (Test-Path $setupExe) {
+        $version = (Get-Content .\build\generated\version.txt -Raw).Trim()
+        $named = "DesktopSplitterSetup-$version.exe"
+        Copy-Item $setupExe $named -Force
+        Write-Host "Setup exe ready: $named ($([math]::Round((Get-Item $named).Length/1MB,1)) MB)"
+        & ".\$named" /verify | Write-Host
+        Write-Host "verify exit code: $LASTEXITCODE"
+        if ($LASTEXITCODE -eq 0) { $finalExit = 0 }
+    } else {
+        Write-Host 'Setup exe NOT produced.'
+    }
 }
 
 try { Stop-Transcript | Out-Null } catch { }
-
-# Append the standalone driver build output to the committed log.
-try {
-    Add-Content -Path 'ci-log.txt' -Value "`n########## DRIVER BUILD LOG (stdout, last 600 lines) ##########"
-    if (Test-Path 'driver-build.log') { Get-Content 'driver-build.log' -Tail 600 | Add-Content -Path 'ci-log.txt' }
-    Add-Content -Path 'ci-log.txt' -Value "`n########## DRIVER BUILD LOG (stderr, last 200 lines) ##########"
-    if (Test-Path 'driver-build.err') { Get-Content 'driver-build.err' -Tail 200 | Add-Content -Path 'ci-log.txt' }
-} catch { }
-
 exit $finalExit
