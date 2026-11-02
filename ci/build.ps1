@@ -163,8 +163,8 @@ if (-not $failAt) {
     $sig = Get-AuthenticodeSignature $catPath
     Write-Host "catalog signature status: $($sig.Status)"
     if ($sig.SignerCertificate) { Write-Host "signer: $($sig.SignerCertificate.Subject)" }
-    if ($sig.Status -eq 'NotSigned' -or -not $sig.SignerCertificate) {
-        Write-Host 'Catalog is UNSIGNED - running repo installer\sign-dev.ps1 (dev cert)...'
+    if ($sig.Status -ne 'Valid') {
+        Write-Host 'Catalog signature is not Valid (stage-payload requires Valid) - running repo installer\sign-dev.ps1 (dev cert)...'
         try {
             & .\installer\sign-dev.ps1 *>&1 | Tee-Object -FilePath (Join-Path $PWD 'logs\sign-dev.log')
             Write-Host "sign-dev completed"
@@ -174,11 +174,15 @@ if (-not $failAt) {
         $sig2 = Get-AuthenticodeSignature $catPath
         Write-Host "catalog signature after sign-dev: $($sig2.Status)"
         if ($sig2.SignerCertificate) { Write-Host "signer: $($sig2.SignerCertificate.Subject)" }
-        if (-not $sig2.SignerCertificate) { $failAt = 'sign-dev' }
+        if ($sig2.Status -ne 'Valid') { $failAt = 'sign-dev' }
     }
 }
 
 Section 'BUILD setup (DesktopSplitterSetup)'
+# stage-payload.ps1 runs inside a powershell.exe (5.1) child spawned by msbuild;
+# it cannot load Microsoft.PowerShell.Security when PSModulePath is polluted by
+# this pwsh 7 session. Clear it so the child rebuilds its own default path.
+[Environment]::SetEnvironmentVariable('PSModulePath', $null, 'Process')
 if (-not $failAt) { if ((Invoke-Logged 'setup' $msbuild @('installer\setup\DesktopSplitterSetup.vcxproj','/p:Configuration=Release','/p:Platform=x64','/v:m','/nologo')) -ne 0) { $failAt = 'setup' } }
 
 Section 'RESULT'
