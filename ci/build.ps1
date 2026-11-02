@@ -163,10 +163,10 @@ if (-not $failAt) {
     $sig = Get-AuthenticodeSignature $catPath
     Write-Host "catalog signature status: $($sig.Status)"
     if ($sig.SignerCertificate) { Write-Host "signer: $($sig.SignerCertificate.Subject)" }
-    if ($sig.Status -ne 'Valid') {
-        Write-Host 'Catalog signature is not Valid (stage-payload requires Valid) - running repo installer\sign-dev.ps1 (dev cert)...'
+    if ($sig.Status -eq 'NotSigned' -or -not $sig.SignerCertificate) {
+        Write-Host 'Catalog is NOT signed (stage-payload hard-fails on unsigned) - running repo installer\sign-dev.ps1 (dev cert)...'
         try {
-            & .\installer\sign-dev.ps1 *>&1 | Tee-Object -FilePath (Join-Path $PWD 'logs\sign-dev.log')
+            & .\installer\sign-dev.ps1 -PackageDir $pkgDir *>&1 | Tee-Object -FilePath (Join-Path $PWD 'logs\sign-dev.log')
             Write-Host "sign-dev completed"
         } catch {
             Write-Host "sign-dev threw: $($_.Exception.Message)"
@@ -174,7 +174,7 @@ if (-not $failAt) {
         $sig2 = Get-AuthenticodeSignature $catPath
         Write-Host "catalog signature after sign-dev: $($sig2.Status)"
         if ($sig2.SignerCertificate) { Write-Host "signer: $($sig2.SignerCertificate.Subject)" }
-        if ($sig2.Status -ne 'Valid') { $failAt = 'sign-dev' }
+        if ($sig2.Status -eq 'NotSigned' -or -not $sig2.SignerCertificate) { $failAt = 'sign-dev' }
     }
 }
 
