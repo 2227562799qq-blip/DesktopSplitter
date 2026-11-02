@@ -163,19 +163,21 @@ if (-not $failAt) {
     $sig = Get-AuthenticodeSignature $catPath
     Write-Host "catalog signature status: $($sig.Status)"
     if ($sig.SignerCertificate) { Write-Host "signer: $($sig.SignerCertificate.Subject)" }
-    if ($sig.Status -eq 'NotSigned' -or -not $sig.SignerCertificate) {
-        Write-Host 'Catalog is NOT signed (stage-payload hard-fails on unsigned) - running repo installer\sign-dev.ps1 (dev cert)...'
-        try {
-            & .\installer\sign-dev.ps1 -PackageDir $pkgDir *>&1 | Tee-Object -FilePath (Join-Path $PWD 'logs\sign-dev.log')
-            Write-Host "sign-dev completed"
-        } catch {
-            Write-Host "sign-dev threw: $($_.Exception.Message)"
-        }
-        $sig2 = Get-AuthenticodeSignature $catPath
-        Write-Host "catalog signature after sign-dev: $($sig2.Status)"
-        if ($sig2.SignerCertificate) { Write-Host "signer: $($sig2.SignerCertificate.Subject)" }
-        if ($sig2.Status -eq 'NotSigned' -or -not $sig2.SignerCertificate) { $failAt = 'sign-dev' }
+    # Always dev-sign with the repo's own sign-dev.ps1 (explicit package dir):
+    # the raw driver build signs the catalog with the build machine's ephemeral
+    # "WDKTestCert <user>" which looks like gibberish in the installer's trust
+    # prompt. Re-signing makes the prompt show "DesktopSplitter Development".
+    Write-Host 'Dev-signing the driver package with installer\sign-dev.ps1 (explicit -PackageDir)...'
+    try {
+        & .\installer\sign-dev.ps1 -PackageDir $pkgDir *>&1 | Tee-Object -FilePath (Join-Path $PWD 'logs\sign-dev.log')
+        Write-Host "sign-dev completed"
+    } catch {
+        Write-Host "sign-dev threw: $($_.Exception.Message)"
     }
+    $sig2 = Get-AuthenticodeSignature $catPath
+    Write-Host "catalog signature after sign-dev: $($sig2.Status)"
+    if ($sig2.SignerCertificate) { Write-Host "signer: $($sig2.SignerCertificate.Subject)" }
+    if ($sig2.Status -eq 'NotSigned' -or -not $sig2.SignerCertificate) { $failAt = 'sign-dev' }
 }
 
 Section 'BUILD setup (DesktopSplitterSetup)'
