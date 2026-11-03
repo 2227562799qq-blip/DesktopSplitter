@@ -215,9 +215,11 @@ if (-not $failAt) {
         if (-not (Test-Path $wufrdT)) { throw 'WUDFRD.inf was NOT restored by the installer' }
         Write-Host 'SELF-TEST: WUDFRD.inf restored by the installer'
 
-        $devT = Get-PnpDevice -FriendlyName 'DesktopSplitter Virtual Display' -ErrorAction Stop | Select-Object -First 1
-        Write-Host "SELF-TEST: device Class=$($devT.Class) Status=$($devT.Status) InstanceId=$($devT.InstanceId)"
-        if ($devT.Class -ne 'Display') { throw "device class is '$($devT.Class)', expected 'Display' (driver not bound)" }
+        $devT = Get-CimInstance Win32_PnPEntity -Filter "Name='DesktopSplitter Virtual Display'" -ErrorAction Stop | Select-Object -First 1
+        if (-not $devT) { throw 'device not found via CIM after install' }
+        Write-Host "SELF-TEST: device PNPClass=$($devT.PNPClass) Status=$($devT.Status) ConfigError=$($devT.ConfigManagerErrorCode) DeviceID=$($devT.DeviceID)"
+        if ($devT.PNPClass -ne 'Display') { throw "device class is '$($devT.PNPClass)', expected 'Display' (driver not bound)" }
+        if ($devT.ConfigManagerErrorCode -ne 0) { throw "device problem code $($devT.ConfigManagerErrorCode), expected 0" }
         Write-Host 'SELF-TEST: PASSED - driver bound on a machine missing WUDFRD.inf'
     } catch {
         Write-Host "SELF-TEST FAILED: $($_.Exception.Message)"
