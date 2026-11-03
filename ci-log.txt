@@ -1,0 +1,355 @@
+**********************
+PowerShell transcript start
+Start time: 20261103024255
+Username: runnervmnjgfq\runneradmin
+RunAs User: runnervmnjgfq\runneradmin
+Configuration Name: 
+Machine: runnervmnjgfq (Microsoft Windows NT 10.0.20348.0)
+Host Application: C:\Program Files\PowerShell\7\pwsh.dll -command . 'D:\a\_temp\dda3ed8e-a24a-4058-8d23-b367da985d9d.ps1'
+Process ID: 7508
+PSVersion: 7.6.9
+PSEdition: Core
+GitCommitId: 7.6.9
+OS: Microsoft Windows 10.0.20348
+Platform: Win32NT
+PSCompatibleVersions: 1.0, 2.0, 3.0, 4.0, 5.0, 5.1, 6.0, 7.0
+PSRemotingProtocolVersion: 2.4
+SerializationVersion: 1.1.0.1
+WSManStackVersion: 3.0
+**********************
+
+########## ENVIRONMENT ##########
+PSVersion: 7.6.9
+OS: Microsoft Windows NT 10.0.20348.0
+Elevated: True
+
+
+winget:
+
+########## INSTALL WINDOWS SDK 10.0.26100 (if missing) ##########
+SDK 26100 already present, skipping
+
+########## INSTALL WDK 10.0.26100 (if IddCx missing) ##########
+IddCx headers already present, skipping WDK install
+
+########## ADD WDK COMPONENT TO VISUAL STUDIO ##########
+VS path: C:\Program Files\Microsoft Visual Studio\2022\Enterprise
+VS modify exit code: 0
+msbuild: C:\Program Files\Microsoft Visual Studio\2022\Enterprise\MSBuild\Current\Bin\amd64\MSBuild.exe
+
+########## GENERATE VERSION FILES (same as build.ps1, NoVersionBump) ##########
+version: 0.5.6
+
+########## BUILD compositor ##########
+>> compositor : C:\Program Files\Microsoft Visual Studio\2022\Enterprise\MSBuild\Current\Bin\amd64\MSBuild.exe compositor\dscomp.vcxproj /p:Configuration=Release /p:Platform=x64 /v:m /nologo
+<< compositor exit code: 0
+
+########## BUILD devcreate ##########
+>> devcreate : C:\Program Files\Microsoft Visual Studio\2022\Enterprise\MSBuild\Current\Bin\amd64\MSBuild.exe installer\devcreate\devcreate.vcxproj /p:Configuration=Release /p:Platform=x64 /v:m /nologo
+<< devcreate exit code: 0
+
+########## BUILD edidoverride ##########
+>> edidoverride : C:\Program Files\Microsoft Visual Studio\2022\Enterprise\MSBuild\Current\Bin\amd64\MSBuild.exe installer\edid-override\edidoverride.vcxproj /p:Configuration=Release /p:Platform=x64 /v:m /nologo
+<< edidoverride exit code: 0
+
+########## BUILD app (dotnet) ##########
+>> app : dotnet build app\DesktopSplitter.csproj -c Release --nologo --disable-build-servers
+<< app exit code: 0
+
+########## BUILD driver ##########
+>> driver : C:\Program Files\Microsoft Visual Studio\2022\Enterprise\MSBuild\Current\Bin\amd64\MSBuild.exe driver\DesktopSplitterVdd.vcxproj /p:Configuration=Release /p:Platform=x64 /p:Inf2CatUseLocalTime=true /v:m /nologo
+<< driver exit code: 0
+
+########## DRIVER CATALOG SIGNATURE ##########
+  desktopsplittervdd.cat 2686
+  DesktopSplitterVdd.dll 69344
+  DesktopSplitterVdd.inf 2498
+catalog signature status: UnknownError
+signer: CN="WDKTestCert runneradmin,134381477447849256"
+Dev-signing the driver package with installer\sign-dev.ps1 (explicit -PackageDir)...
+Creating self-signed code-signing certificate: CN=DesktopSplitter Development
+Creating self-signed code-signing certificate: CN=DesktopSplitter Development
+Created certificate: 6FAE0842C017D439A5AFDEA46CACFF3D37EB5044
+Created certificate: 6FAE0842C017D439A5AFDEA46CACFF3D37EB5044
+Importing certificate into LocalMachine\Root
+Importing certificate into LocalMachine\Root
+Importing certificate into LocalMachine\TrustedPublisher
+Importing certificate into LocalMachine\TrustedPublisher
+signtool: C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\signtool.exe
+signtool: C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\signtool.exe
+package : D:\a\DesktopSplitter\DesktopSplitter\driver\x64\Release\DesktopSplitterVdd
+package : D:\a\DesktopSplitter\DesktopSplitter\driver\x64\Release\DesktopSplitterVdd
+Signing D:\a\DesktopSplitter\DesktopSplitter\driver\x64\Release\DesktopSplitterVdd\DesktopSplitterVdd.dll
+Signing D:\a\DesktopSplitter\DesktopSplitter\driver\x64\Release\DesktopSplitterVdd\DesktopSplitterVdd.dll
+The following certificate was selected:
+    Issued to: DesktopSplitter Development
+
+    Issued by: DesktopSplitter Development
+
+    Expires:   Mon Nov 03 02:49:09 2031
+
+    SHA1 hash: 6FAE0842C017D439A5AFDEA46CACFF3D37EB5044
+
+
+Done Adding Additional Store
+Successfully signed: D:\a\DesktopSplitter\DesktopSplitter\driver\x64\Release\DesktopSplitterVdd\DesktopSplitterVdd.dll
+
+
+Number of files successfully Signed: 1
+
+Number of warnings: 0
+
+Number of errors: 0
+
+Signing D:\a\DesktopSplitter\DesktopSplitter\driver\x64\Release\DesktopSplitterVdd\DesktopSplitterVdd.cat
+Signing D:\a\DesktopSplitter\DesktopSplitter\driver\x64\Release\DesktopSplitterVdd\DesktopSplitterVdd.cat
+The following certificate was selected:
+    Issued to: DesktopSplitter Development
+
+    Issued by: DesktopSplitter Development
+
+    Expires:   Mon Nov 03 02:49:09 2031
+
+    SHA1 hash: 6FAE0842C017D439A5AFDEA46CACFF3D37EB5044
+
+
+Done Adding Additional Store
+Successfully signed: D:\a\DesktopSplitter\DesktopSplitter\driver\x64\Release\DesktopSplitterVdd\desktopsplittervdd.cat
+
+
+Number of files successfully Signed: 1
+
+Number of warnings: 0
+
+Number of errors: 0
+
+
+
+Signing complete.
+Signing complete.
+
+
+No test-signing mode is required: this is a user-mode (UMDF) driver and the
+No test-signing mode is required: this is a user-mode (UMDF) driver and the
+signing certificate is now trusted machine-wide. Secure Boot can stay enabled.
+signing certificate is now trusted machine-wide. Secure Boot can stay enabled.
+If you previously enabled test signing for this driver, you can turn it off:
+If you previously enabled test signing for this driver, you can turn it off:
+    bcdedit /set testsigning off   (then reboot)
+    bcdedit /set testsigning off   (then reboot)
+
+
+Note: the certificate trust is per-machine. To ship to other machines without
+Note: the certificate trust is per-machine. To ship to other machines without
+installing a certificate, use Microsoft attestation signing (docs/BUILDING.md).
+installing a certificate, use Microsoft attestation signing (docs/BUILDING.md).
+sign-dev completed
+catalog signature after sign-dev: Valid
+signer: CN=DesktopSplitter Development
+
+########## BUILD setup (DesktopSplitterSetup) ##########
+>> setup : C:\Program Files\Microsoft Visual Studio\2022\Enterprise\MSBuild\Current\Bin\amd64\MSBuild.exe installer\setup\DesktopSplitterSetup.vcxproj /p:Configuration=Release /p:Platform=x64 /v:m /nologo
+<< setup exit code: 0
+
+########## SELF-TEST (sabotaged WUDFRD.inf, silent install) ##########
+SELF-TEST: WUDFRD.inf hidden (simulating the target PC)
+SELF-TEST: setup exit code = 0
+SELF-TEST: WUDFRD.inf restored by the installer
+SELF-TEST: device PNPClass=Display Status=OK ConfigError=0 DeviceID=ROOT\DISPLAY\0000
+SELF-TEST: PASSED - driver bound on a machine missing WUDFRD.inf
+
+########## RESULT ##########
+Setup exe ready: DesktopSplitterSetup-0.5.6.exe (139.6 MB)
+DesktopSplitter ==============================
+
+Windows  DesktopSplitterVdd.inf           2498   DesktopSplitterVdd.dll          68512   DesktopSplitterVdd.cat           2675   DesktopSplitter.exe         145262469   dscomp.exe                     220672   devcreate.exe                  147456   edidoverride.exe               383488   compositor-README.md            23208
+  WinVerifyTrust 0x00000000 - ?????????????????
+        SHA-1
+
+verify exit code: 0
+**********************
+PowerShell transcript end
+End time: 20261103024935
+**********************
+
+########## STEP LOG: compositor (last 300 lines) ##########
+
+  Capture.cpp
+  Config.cpp
+  CursorConfine.cpp
+  Json.cpp
+  Log.cpp
+  Main.cpp
+  MonitorUtil.cpp
+  Renderer.cpp
+  SessionWatcher.cpp
+  SpecializedPresenter.cpp
+  WindowPresenter.cpp
+  WindowRescuer.cpp
+  Generating code
+  Previous IPDB not found, fall back to full compilation.
+  All 3290 functions were compiled because no usable IPDB/IOBJ from previous compilation was found.
+  Finished generating code
+  dscomp.vcxproj -> D:\a\DesktopSplitter\DesktopSplitter\compositor\build\x64\Release\dscomp.exe
+
+########## STEP LOG: devcreate (last 300 lines) ##########
+
+  devcreate.cpp
+  Generating code
+  Previous IPDB not found, fall back to full compilation.
+  All 21 functions were compiled because no usable IPDB/IOBJ from previous compilation was found.
+  Finished generating code
+  devcreate.vcxproj -> D:\a\DesktopSplitter\DesktopSplitter\installer\devcreate\bin\x64\Release\devcreate.exe
+
+########## STEP LOG: edidoverride (last 300 lines) ##########
+
+  Guard.cpp
+  Main.cpp
+  Generating Code...
+  edidoverride.vcxproj -> D:\a\DesktopSplitter\DesktopSplitter\installer\edid-override\build\x64\Release\edidoverride.exe
+
+########## STEP LOG: app (last 300 lines) ##########
+  Determining projects to restore...
+  Restored D:\a\DesktopSplitter\DesktopSplitter\app\DesktopSplitter.csproj (in 8.82 sec).
+  DesktopSplitter -> D:\a\DesktopSplitter\DesktopSplitter\app\bin\Release\net8.0-windows\DesktopSplitter.dll
+
+Build succeeded.
+    0 Warning(s)
+    0 Error(s)
+
+Time Elapsed 00:00:23.16
+
+########## STEP LOG: driver (last 300 lines) ##########
+
+  Building 'DesktopSplitterVdd' with toolset 'WindowsUserModeDriver10.0' and the 'Universal' target platform.
+  Stamping x64\Release\DesktopSplitterVdd.inf
+  Stamping [Version] section with DriverVer=11/03/2026,2.48.56.666
+  Driver.cpp
+  Edid.cpp
+  Guids.cpp
+  Timing.cpp
+  Running Code Analysis for C/C++...
+  Generating Code...
+     Creating library D:\a\DesktopSplitter\DesktopSplitter\driver\x64\Release\DesktopSplitterVdd.lib and object D:\a\DesktopSplitter\DesktopSplitter\driver\x64\Release\DesktopSplitterVdd.exp
+  DesktopSplitterVdd.vcxproj -> D:\a\DesktopSplitter\DesktopSplitter\driver\x64\Release\DesktopSplitterVdd.dll
+  Done Adding Additional Store
+  Successfully signed: D:\a\DesktopSplitter\DesktopSplitter\driver\x64\Release\DesktopSplitterVdd.dll
+  
+  Driver is 'Universal'.
+  ........................
+  Signability test complete.
+  
+  Errors:
+  None
+  
+  Warnings:
+  None
+  
+  Catalog generation complete.
+  D:\a\DesktopSplitter\DesktopSplitter\driver\x64\Release\DesktopSplitterVdd\desktopsplittervdd.cat
+  Set catalog attribute.
+  WdkVersion: 10.0.26100.0
+  Set catalog attribute.
+  WdkAssemblyVersion: 10.0.26100.4202
+  Done Adding Additional Store
+  Successfully signed: D:\a\DesktopSplitter\DesktopSplitter\driver\x64\Release\DesktopSplitterVdd\desktopsplittervdd.cat
+  
+
+########## STEP LOG: sign-dev (last 300 lines) ##########
+Creating self-signed code-signing certificate: CN=DesktopSplitter Development
+Created certificate: 6FAE0842C017D439A5AFDEA46CACFF3D37EB5044
+Importing certificate into LocalMachine\Root
+Importing certificate into LocalMachine\TrustedPublisher
+signtool: C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\signtool.exe
+package : D:\a\DesktopSplitter\DesktopSplitter\driver\x64\Release\DesktopSplitterVdd
+Signing D:\a\DesktopSplitter\DesktopSplitter\driver\x64\Release\DesktopSplitterVdd\DesktopSplitterVdd.dll
+The following certificate was selected:
+    Issued to: DesktopSplitter Development
+
+    Issued by: DesktopSplitter Development
+
+    Expires:   Mon Nov 03 02:49:09 2031
+
+    SHA1 hash: 6FAE0842C017D439A5AFDEA46CACFF3D37EB5044
+
+
+Done Adding Additional Store
+Successfully signed: D:\a\DesktopSplitter\DesktopSplitter\driver\x64\Release\DesktopSplitterVdd\DesktopSplitterVdd.dll
+
+
+Number of files successfully Signed: 1
+
+Number of warnings: 0
+
+Number of errors: 0
+
+Signing D:\a\DesktopSplitter\DesktopSplitter\driver\x64\Release\DesktopSplitterVdd\DesktopSplitterVdd.cat
+The following certificate was selected:
+    Issued to: DesktopSplitter Development
+
+    Issued by: DesktopSplitter Development
+
+    Expires:   Mon Nov 03 02:49:09 2031
+
+    SHA1 hash: 6FAE0842C017D439A5AFDEA46CACFF3D37EB5044
+
+
+Done Adding Additional Store
+Successfully signed: D:\a\DesktopSplitter\DesktopSplitter\driver\x64\Release\DesktopSplitterVdd\desktopsplittervdd.cat
+
+
+Number of files successfully Signed: 1
+
+Number of warnings: 0
+
+Number of errors: 0
+
+
+Signing complete.
+
+No test-signing mode is required: this is a user-mode (UMDF) driver and the
+signing certificate is now trusted machine-wide. Secure Boot can stay enabled.
+If you previously enabled test signing for this driver, you can turn it off:
+    bcdedit /set testsigning off   (then reboot)
+
+Note: the certificate trust is per-machine. To ship to other machines without
+installing a certificate, use Microsoft attestation signing (docs/BUILDING.md).
+
+########## STEP LOG: setup (last 300 lines) ##########
+
+  Staging driver package and product files for embedding...
+  stage-payload : catalog signature is trusted on this machine (CN=DesktopSplitter Development)
+  stage-payload : signer = CN=DesktopSplitter Development
+  stage-payload : sha1   = 6FAE0842C017D439A5AFDEA46CACFF3D37EB5044
+  stage-payload : staged inbox repair copy of WUDFRD.inf
+  stage-payload : publishing the control app self-contained (this takes a while)...
+        Determining projects to restore...
+        Restored D:\a\DesktopSplitter\DesktopSplitter\app\DesktopSplitter.csproj (in 958 ms).
+        DesktopSplitter -> D:\a\DesktopSplitter\DesktopSplitter\app\bin\Release\net8.0-windows\win-x64\DesktopSplitter.dll
+        DesktopSplitter -> D:\a\DesktopSplitter\DesktopSplitter\installer\setup\obj\apppublish\
+  stage-payload : app publish -> D:\a\DesktopSplitter\DesktopSplitter\installer\setup\obj\apppublish\DesktopSplitter.exe
+  stage-payload : staged DesktopSplitterVdd.inf          2,498 bytes
+  stage-payload : staged DesktopSplitterVdd.dll         68,512 bytes
+  stage-payload : staged DesktopSplitterVdd.cat          2,675 bytes
+  stage-payload : staged DesktopSplitter.exe       145,262,469 bytes
+  stage-payload : staged dscomp.exe                    220,672 bytes
+  stage-payload : staged devcreate.exe                 147,456 bytes
+  stage-payload : staged edidoverride.exe              383,488 bytes
+  stage-payload : staged compositor-README.md           23,208 bytes
+  stage-payload : total payload 139.3 MB
+  stage-payload : payload ready in D:\a\DesktopSplitter\DesktopSplitter\installer\setup\payload
+  Setup.cpp
+  Wizard.cpp
+  InstallEngine.cpp
+  ProductFiles.cpp
+  Edition.cpp
+  Payload.cpp
+  Trust.cpp
+  DriverPackage.cpp
+  Guids.cpp
+  DeviceNode.cpp
+  Generating code
+  Previous IPDB not found, fall back to full compilation.
+  All 147 functions were compiled because no usable IPDB/IOBJ from previous compilation was found.
+  Finished generating code
+  DesktopSplitterSetup.vcxproj -> D:\a\DesktopSplitter\DesktopSplitter\installer\setup\bin\x64\Release\DesktopSplitterSetup.exe
