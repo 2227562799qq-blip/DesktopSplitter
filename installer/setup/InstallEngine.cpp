@@ -340,6 +340,43 @@ namespace DeskSplit
     }
 
     _Use_decl_annotations_
+    // WUDFRD.inf is the inbox INF that gives every UMDF device its reflector
+    // service association; this driver package Includes it. On machines where
+    // the file has gone missing from %WINDIR%\INF, device installation fails
+    // with 0xe0000219 ("a function driver was not specified") even though the
+    // driver package itself is fine. The installer embeds a copy of the build
+    // machine's inbox WUDFRD.inf and restores it when - and only when - the
+    // target machine lacks it.
+    bool EnsureWufrdInf(IStepSink* pSink)
+    {
+        wchar_t InfPath[MAX_PATH];
+        if (GetWindowsDirectoryW(InfPath, ARRAYSIZE(InfPath)) == 0)
+        {
+            ReportWin32(pSink, L"定位系统目录", GetLastError());
+            return false;
+        }
+        if (FAILED(StringCchCatW(InfPath, ARRAYSIZE(InfPath), L"\\INF\\WUDFRD.inf")))
+        {
+            return false;
+        }
+
+        if (GetFileAttributesW(InfPath) != INVALID_FILE_ATTRIBUTES)
+        {
+            Detailf(pSink, L"WUDFRD.inf 已存在，无需修复。");
+            return true;
+        }
+
+        Detailf(pSink, L"系统缺少 WUDFRD.inf（UMDF 驱动必需的系统文件），正在补回…");
+        const DWORD Error = WriteResourceToFile(IDR_WUDFRD_INF, InfPath);
+        if (Error != ERROR_SUCCESS)
+        {
+            ReportWin32(pSink, L"补回 WUDFRD.inf", Error);
+            return false;
+        }
+        Detailf(pSink, L"已补回 %s", InfPath);
+        return true;
+    }
+
     int RunInstallSequence(const InstallOptions* pOptions, IStepSink* pSink)
     {
         pSink->OnProgress(0);
@@ -459,6 +496,16 @@ namespace DeskSplit
                 Detailf(pSink, L"此电脑已信任该发布者 - 无需更改。");
             }
             pSink->OnProgress(25);
+
+            // ---- 3.5 inbox UMDF support file ------------------------------
+            Stepf(pSink, L"检查系统组件");
+            if (!EnsureWufrdInf(pSink))
+            {
+                Errorf(pSink, L"系统组件 WUDFRD.inf 缺失且无法自动补回，驱动无法安装。");
+                Result = ExitDriverInstallFailed;
+                break;
+            }
+            pSink->OnProgress(28);
 
             // ---- 4. driver package ----------------------------------------
             Stepf(pSink, L"安装显示驱动");

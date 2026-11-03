@@ -187,6 +187,50 @@ Section 'BUILD setup (DesktopSplitterSetup)'
 [Environment]::SetEnvironmentVariable('PSModulePath', $null, 'Process')
 if (-not $failAt) { if ((Invoke-Logged 'setup' $msbuild @('installer\setup\DesktopSplitterSetup.vcxproj','/p:Configuration=Release','/p:Platform=x64','/v:m','/nologo')) -ne 0) { $failAt = 'setup' } }
 
+Section 'SELF-TEST (sabotaged WUDFRD.inf, silent install)'
+# Reproduce the target PC's defect on this throwaway runner: hide the inbox
+# WUDFRD.inf, run the installer with /quiet, and require that (a) the
+# installer restores WUDFRD.inf itself and (b) the virtual display device
+# ends up bound to the driver (Class = Display). If this fails, the build
+# fails and no release is published.
+if (-not $failAt) {
+    $setupExeT = 'installer\setup\bin\x64\Release\DesktopSplitterSetup.exe'
+    $namedT = "DesktopSplitterSetup-$version.exe"
+    Copy-Item $setupExeT $namedT -Force
+    $wufrdT = Join-Path $env:WINDIR 'INF\WUDFRD.inf'
+    $wufrdBakT = "$wufrdT.citest.bak"
+    try {
+        if (-not (Test-Path $wufrdT)) { throw "runner unexpectedly lacks $wufrdT" }
+        & takeown /f $wufrdT | Out-Null
+        & icacls $wufrdT /grant '*S-1-5-32-544:F' | Out-Null
+        Rename-Item $wufrdT $wufrdBakT -Force
+        if (Test-Path $wufrdT) { throw 'sabotage failed: WUDFRD.inf still present' }
+        Write-Host 'SELF-TEST: WUDFRD.inf hidden (simulating the target PC)'
+
+        $procT = Start-Process -FilePath (Join-Path $PWD $namedT) -ArgumentList '/quiet' -PassThru
+        if (-not $procT.WaitForExit(600000)) { $procT.Kill(); throw 'setup /quiet timed out after 10 minutes' }
+        Write-Host "SELF-TEST: setup exit code = $($procT.ExitCode)"
+        if ($procT.ExitCode -ne 0) { throw "setup /quiet failed with exit $($procT.ExitCode)" }
+
+        if (-not (Test-Path $wufrdT)) { throw 'WUDFRD.inf was NOT restored by the installer' }
+        Write-Host 'SELF-TEST: WUDFRD.inf restored by the installer'
+
+        $devT = Get-PnpDevice -FriendlyName 'DesktopSplitter Virtual Display' -ErrorAction Stop | Select-Object -First 1
+        Write-Host "SELF-TEST: device Class=$($devT.Class) Status=$($devT.Status) InstanceId=$($devT.InstanceId)"
+        if ($devT.Class -ne 'Display') { throw "device class is '$($devT.Class)', expected 'Display' (driver not bound)" }
+        Write-Host 'SELF-TEST: PASSED - driver bound on a machine missing WUDFRD.inf'
+    } catch {
+        Write-Host "SELF-TEST FAILED: $($_.Exception.Message)"
+        $failAt = 'self-test'
+    } finally {
+        try {
+            $unT = Start-Process -FilePath (Join-Path $PWD $namedT) -ArgumentList '/uninstall','/quiet' -PassThru
+            if (-not $unT.WaitForExit(300000)) { $unT.Kill() }
+        } catch { }
+        if (Test-Path $wufrdBakT) { Rename-Item $wufrdBakT $wufrdT -Force -ErrorAction SilentlyContinue }
+    }
+}
+
 Section 'RESULT'
 $finalExit = 1
 $setupExe = 'installer\setup\bin\x64\Release\DesktopSplitterSetup.exe'
