@@ -287,21 +287,37 @@ Section 'PUBLISH LICENSED RELEASE (licensing branch only)'
 # main's rolling "latest" release is owned by build.yml and must keep pointing at
 # the clean build the upstream PR describes. The licensed build gets its own
 # versioned release instead, published here with the runner's own token.
+# NOTE: the transcript is already stopped by this point, so gh output is appended
+# to ci-log.txt explicitly - otherwise a publish failure leaves no trace in the
+# log (that is exactly what happened in run 43867193524: everything built and
+# both self-tests passed, but the job still failed with no visible cause).
 if ($finalExit -eq 0 -and $env:GITHUB_REF -eq 'refs/heads/licensing') {
     $tag = "v$version"
     $named = "DesktopSplitterSetup-$version.exe"
+    if ($env:GITHUB_TOKEN -and -not $env:GH_TOKEN) { $env:GH_TOKEN = $env:GITHUB_TOKEN }
     try {
-        & gh release view $tag --json tagName 2>$null | Out-Null
-        if ($LASTEXITCODE -ne 0) {
-            & gh release create $tag --title "v$version (licensed)" --prerelease `
-                --notes "DesktopSplitter $version with MAC-bound licensing: 60-day trial on first launch, split disabled after expiry, activate by pasting a license code." | Write-Host
-            if ($LASTEXITCODE -ne 0) { throw "gh release create $tag failed" }
+        Add-Content -Path $logPath -Value "`n########## PUBLISH LICENSED RELEASE ##########"
+        Add-Content -Path $logPath -Value "gh on PATH: $(if (Get-Command gh -ErrorAction SilentlyContinue) { 'yes' } else { 'no' })"
+        Add-Content -Path $logPath -Value "GH_TOKEN present: $(if ($env:GH_TOKEN) { 'yes' } else { 'no' })"
+        $viewOut = & gh release view $tag --json tagName 2>&1
+        $viewCode = $LASTEXITCODE
+        Add-Content -Path $logPath -Value "gh release view exit=$viewCode out=$viewOut"
+        if ($viewCode -ne 0) {
+            $createOut = & gh release create $tag --title "v$version (licensed)" --prerelease `
+                --notes "DesktopSplitter $version with MAC-bound licensing: 60-day trial on first launch, split disabled after expiry, activate by pasting a license code." 2>&1
+            $createCode = $LASTEXITCODE
+            Add-Content -Path $logPath -Value "gh release create exit=$createCode out=$createOut"
+            if ($createCode -ne 0) { throw "gh release create $tag failed: $createOut" }
         }
-        & gh release upload $tag $named --clobber | Write-Host
-        if ($LASTEXITCODE -ne 0) { throw "gh release upload failed" }
+        $upOut = & gh release upload $tag $named --clobber 2>&1
+        $upCode = $LASTEXITCODE
+        Add-Content -Path $logPath -Value "gh release upload exit=$upCode out=$upOut"
+        if ($upCode -ne 0) { throw "gh release upload failed: $upOut" }
         Write-Host "LICENSED RELEASE: $tag now serves $named"
+        Add-Content -Path $logPath -Value "LICENSED RELEASE: $tag now serves $named"
     } catch {
         Write-Host "LICENSED RELEASE FAILED: $($_.Exception.Message)"
+        Add-Content -Path $logPath -Value "LICENSED RELEASE FAILED: $($_.Exception.Message)"
         $finalExit = 1
     }
 }
