@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.IO;
 using System.Net.NetworkInformation;
 using System.Security.Cryptography;
 using System.Text;
@@ -254,7 +255,7 @@ public static class LicenseService
     }
 
     public static IReadOnlyList<string> GetPhysicalMacs() =>
-        GetPhysicalAdapters().Select(FormatMac).Where(m => m.Length == 17).ToList();
+        GetPhysicalAdapters().Select(n => FormatMac(n.GetPhysicalAddress())).Where(m => m.Length == 17).ToList();
 
     private static IReadOnlyList<NetworkInterface> GetPhysicalAdapters()
     {
@@ -289,10 +290,14 @@ public static class LicenseService
 
     public static string NormalizeMac(string mac)
     {
-        string hex = new string(mac.Where(char.IsHexDigit).ToArray()).ToUpperInvariant();
+        // char.IsHexDigit does not exist on net8.0; use an explicit range check.
+        string hex = new string(mac.Where(IsHexDigit).ToArray()).ToUpperInvariant();
         if (hex.Length != 12) return string.Empty;
         return string.Join("-", Enumerable.Range(0, 6).Select(i => hex.Substring(i * 2, 2)));
     }
+
+    private static bool IsHexDigit(char c) =>
+        (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
 
     // ------------------------------------------------------------------ trial store
 
