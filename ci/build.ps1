@@ -233,6 +233,23 @@ if (-not $failAt) {
     }
 }
 
+Section 'LICENSE-TEST (license code sign/verify, trial)'
+# The license logic is pure .NET, so the same source the app compiles is run here
+# as a console harness: cross-language test vector (Python generator), C# sign /
+# verify round-trip, tampering / wrong-MAC / expired / malformed rejection, and
+# the 60-day trial starting on first launch. Any failure fails the build.
+if (-not $failAt) {
+    try {
+        $licOut = & dotnet run --project ci\test-license\test-license.csproj -c Release --nologo --disable-build-servers 2>&1
+        $licOut | ForEach-Object { Write-Host $_ }
+        if ($LASTEXITCODE -ne 0) { throw "license test harness exited $LASTEXITCODE" }
+        Write-Host 'LICENSE-TEST: PASSED'
+    } catch {
+        Write-Host "LICENSE-TEST FAILED: $($_.Exception.Message)"
+        $failAt = 'license-test'
+    }
+}
+
 Section 'RESULT'
 $finalExit = 1
 $setupExe = 'installer\setup\bin\x64\Release\DesktopSplitterSetup.exe'
@@ -265,5 +282,28 @@ try {
         }
     }
 } catch { }
+
+Section 'PUBLISH LICENSED RELEASE (licensing branch only)'
+# main's rolling "latest" release is owned by build.yml and must keep pointing at
+# the clean build the upstream PR describes. The licensed build gets its own
+# versioned release instead, published here with the runner's own token.
+if ($finalExit -eq 0 -and $env:GITHUB_REF -eq 'refs/heads/licensing') {
+    $tag = "v$version"
+    $named = "DesktopSplitterSetup-$version.exe"
+    try {
+        & gh release view $tag --json tagName 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            & gh release create $tag --title "v$version (licensed)" --prerelease `
+                --notes "DesktopSplitter $version with MAC-bound licensing: 60-day trial on first launch, split disabled after expiry, activate by pasting a license code." | Write-Host
+            if ($LASTEXITCODE -ne 0) { throw "gh release create $tag failed" }
+        }
+        & gh release upload $tag $named --clobber | Write-Host
+        if ($LASTEXITCODE -ne 0) { throw "gh release upload failed" }
+        Write-Host "LICENSED RELEASE: $tag now serves $named"
+    } catch {
+        Write-Host "LICENSED RELEASE FAILED: $($_.Exception.Message)"
+        $finalExit = 1
+    }
+}
 
 exit $finalExit

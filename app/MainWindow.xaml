@@ -187,6 +187,8 @@
                        Margin="0,4,0,0" TextWrapping="Wrap"/>
             <TextBlock Text="{Binding CompositorStatus}" Foreground="{StaticResource MutedBrush}"
                        TextWrapping="Wrap"/>
+            <TextBlock Text="{Binding LicenseStatusText}" Foreground="{StaticResource MutedBrush}"
+                       TextWrapping="Wrap"/>
         </StackPanel>
 
         <!-- Body -->
@@ -403,6 +405,8 @@
                     Command="{Binding ApplyCommand}"/>
             <Button Content="撤销" Margin="10,0,0,0" MinWidth="110"
                     Command="{Binding RevertCommand}"/>
+            <Button Content="授权" Margin="10,0,0,0" MinWidth="110"
+                    Command="{Binding OpenLicenseCommand}"/>
             <Button Content="最小化到托盘" Margin="10,0,0,0"
                     Command="{Binding MinimizeToTrayCommand}"/>
         </StackPanel>

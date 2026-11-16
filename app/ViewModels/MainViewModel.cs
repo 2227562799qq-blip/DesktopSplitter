@@ -27,6 +27,7 @@ public sealed class MainViewModel : ObservableObject
     private double _canvasWidth = MaxCanvasWidth;
     private double _canvasHeight = 200;
     private bool _isBusy;
+    private LicenseService.LicenseStatus _licenseStatus = LicenseService.GetStatus();
     private bool _suppressSegmentRebuild;
     private IApplyConfirmer? _applyConfirmer;
     private SplitSuspensionWatcher? _suspensionWatcher;
@@ -56,6 +57,7 @@ public sealed class MainViewModel : ObservableObject
         ApplyCommand = new RelayCommand(async () => await ApplyAsync().ConfigureAwait(false), () => CanApply);
         RevertCommand = new RelayCommand(async () => await RevertAsync().ConfigureAwait(false), () => !IsBusy);
         MinimizeToTrayCommand = new RelayCommand(() => MinimizeToTrayRequested?.Invoke(this, EventArgs.Empty));
+        OpenLicenseCommand = new RelayCommand(() => LicenseRequested?.Invoke(this, EventArgs.Empty), () => !IsBusy);
 
         _selectedLayout = Layouts[0];
 
@@ -67,6 +69,7 @@ public sealed class MainViewModel : ObservableObject
         RefreshCompositorStatus();
 
         AppendStatus("就绪。");
+        AppendStatus("授权状态：" + _licenseStatus.DisplayText);
 
         // If a previous session died while the physical monitor was hidden, put it back.
         _ = RecoverThenRefreshAsync();
@@ -202,6 +205,14 @@ public sealed class MainViewModel : ObservableObject
         AppSettings? settings = SettingsStore.Load();
         bool splitActive = await Task.Run(HidingStatus.IsSplitActive).ConfigureAwait(true);
 
+        // Trial expired while a split was still live: drop the split instead of re-applying it.
+        if (splitActive && !_licenseStatus.CanApply)
+        {
+            AppendStatus("授权已过期，正在恢复为单屏……");
+            await RevertAsync().ConfigureAwait(true);
+            return;
+        }
+
         if (!ApplyService.ShouldAutoApplyOnStartup(settings, splitActive)) return;
         if (!RestoreSettings(settings))
         {
@@ -307,6 +318,21 @@ public sealed class MainViewModel : ObservableObject
         private set => SetProperty(ref _compositorStatus, value);
     }
 
+    /// <summary>License line in the header: trial days left, licensed-until, or 未注册.</summary>
+    public string LicenseStatusText => _licenseStatus.DisplayText;
+
+    /// <summary>True while the trial runs or a valid license is present.</summary>
+    public bool IsLicensedOrTrial => _licenseStatus.CanApply;
+
+    /// <summary>Re-reads the license state (e.g. after the license dialog closes).</summary>
+    public void RefreshLicenseStatus()
+    {
+        _licenseStatus = LicenseService.GetStatus();
+        OnPropertyChanged(nameof(LicenseStatusText));
+        OnPropertyChanged(nameof(IsLicensedOrTrial));
+        RaiseCommandStates();
+    }
+
     /// <summary>
     /// Subtle informational note (not an error) shown when the segment sizes do not add up
     /// to the monitor dimension — the compositor scales each capture into its physRect.
@@ -356,6 +382,7 @@ public sealed class MainViewModel : ObservableObject
 
     public bool CanApply =>
         !IsBusy &&
+        _licenseStatus.CanApply &&
         SelectedMonitor is not null &&
         SelectedLayout is not null &&
         Segments.Count == SelectedLayout.SegmentCount &&
@@ -368,8 +395,10 @@ public sealed class MainViewModel : ObservableObject
     public RelayCommand ApplyCommand { get; }
     public RelayCommand RevertCommand { get; }
     public RelayCommand MinimizeToTrayCommand { get; }
+    public RelayCommand OpenLicenseCommand { get; }
 
     public event EventHandler? MinimizeToTrayRequested;
+    public event EventHandler? LicenseRequested;
 
     /// <summary>
     /// Crash recovery: a previous session may have died with the physical monitor still removed
@@ -755,6 +784,12 @@ public sealed class MainViewModel : ObservableObject
 
     public async Task ApplyAsync(bool promptToConfirm)
     {
+        RefreshLicenseStatus();
+        if (!_licenseStatus.CanApply)
+        {
+            AppendStatus(LicenseService.NotLicensedMessage);
+            return;
+        }
         if (!CanApply) return;
 
         MonitorInfo physical = SelectedMonitor!;

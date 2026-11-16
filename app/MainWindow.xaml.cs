@@ -38,6 +38,12 @@ public partial class MainWindow : Window, IHidingUi
         };
 
         _viewModel.MinimizeToTrayRequested += (_, _) => HideToTray();
+        _viewModel.LicenseRequested += (_, _) =>
+        {
+            var window = new LicenseWindow { Owner = this };
+            window.ShowDialog();
+            _viewModel.RefreshLicenseStatus();
+        };
         _viewModel.StatusAppended += (_, _) => Dispatcher.BeginInvoke(new Action(() => StatusBox.ScrollToEnd()));
 
         _viewModel.Hiding.AttachUi(this);

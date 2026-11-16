@@ -53,6 +53,15 @@ public partial class App : Application
 
         _window = new MainWindow(_viewModel, _tray);
 
+        // Expired license: the app still opens and the split is dropped (see
+        // AutoApplyOnStartupAsync), but the user is told once, on launch.
+        if (!LaunchedAtStartup && !_viewModel.IsLicensedOrTrial)
+        {
+            MessageBox.Show(
+                LicenseService.NotLicensedMessage,
+                "DesktopSplitter", MessageBoxButton.OK, MessageBoxImage.Warning);
+        }
+
         // Auto-started at logon: go straight to the tray rather than popping the window open.
         if (!LaunchedAtStartup) _window.Show();
 
