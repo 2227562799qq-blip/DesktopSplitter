@@ -23,6 +23,8 @@ jobs:
 
       - name: Build via repo script
         shell: pwsh
+        env:
+           GH_TOKEN: ${{ github.token }}
         run: ./ci/build.ps1
 
       - name: Save build log to ci-logs branch
