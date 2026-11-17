@@ -1,6 +1,7 @@
 using System.Collections.ObjectModel;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Windows.Threading;
 using DesktopSplitter.Interop;
 using DesktopSplitter.Models;
 using DesktopSplitter.Services;
@@ -28,6 +29,8 @@ public sealed class MainViewModel : ObservableObject
     private double _canvasHeight = 200;
     private bool _isBusy;
     private LicenseService.LicenseStatus _licenseStatus = LicenseService.GetStatus();
+    private readonly DispatcherTimer _licenseTimer;
+    private bool _expiryNotified;
     private bool _suppressSegmentRebuild;
     private IApplyConfirmer? _applyConfirmer;
     private SplitSuspensionWatcher? _suspensionWatcher;
@@ -70,6 +73,14 @@ public sealed class MainViewModel : ObservableObject
 
         AppendStatus("就绪。");
         AppendStatus("授权状态：" + _licenseStatus.DisplayText);
+
+        // Re-check the license while the app stays open: without this, a license that
+        // expires mid-session would silently keep working until the next restart, and
+        // the customer would never come back to renew. Every 5 minutes the status is
+        // re-read; a fresh expiry drops a live split and notifies once.
+        _licenseTimer = new DispatcherTimer { Interval = TimeSpan.FromMinutes(5) };
+        _licenseTimer.Tick += async (_, _) => await CheckLicenseAsync().ConfigureAwait(true);
+        _licenseTimer.Start();
 
         // If a previous session died while the physical monitor was hidden, put it back.
         _ = RecoverThenRefreshAsync();
@@ -334,6 +345,44 @@ public sealed class MainViewModel : ObservableObject
     }
 
     /// <summary>
+    /// Periodic re-check (see the timer in the constructor). If the license expired
+    /// while the app was running, a live split is dropped and the expiry is reported
+    /// once via <see cref="LicenseExpired"/>; the flag resets if a valid license
+    /// shows up again (e.g. the clock was set back or a new code was activated).
+    /// </summary>
+    private async Task CheckLicenseAsync()
+    {
+        try
+        {
+            bool wasValid = _licenseStatus.CanApply;
+            RefreshLicenseStatus();
+            if (_licenseStatus.CanApply)
+            {
+                _expiryNotified = false;
+                return;
+            }
+            if (!wasValid) return;
+
+            bool splitActive = await Task.Run(HidingStatus.IsSplitActive).ConfigureAwait(true);
+            if (splitActive)
+            {
+                AppendStatus("授权已过期，正在恢复为单屏……");
+                await RevertAsync().ConfigureAwait(true);
+            }
+            if (!_expiryNotified)
+            {
+                _expiryNotified = true;
+                LicenseExpired?.Invoke(this, EventArgs.Empty);
+            }
+        }
+        catch (Exception ex)
+        {
+            // A background re-check must never take the app down.
+            AppendStatus("授权复查失败（已忽略）： " + ex.Message);
+        }
+    }
+
+    /// <summary>
     /// Subtle informational note (not an error) shown when the segment sizes do not add up
     /// to the monitor dimension — the compositor scales each capture into its physRect.
     /// </summary>
@@ -399,6 +448,9 @@ public sealed class MainViewModel : ObservableObject
 
     public event EventHandler? MinimizeToTrayRequested;
     public event EventHandler? LicenseRequested;
+
+    /// <summary>Raised once when a previously valid license expires while the app runs.</summary>
+    public event EventHandler? LicenseExpired;
 
     /// <summary>
     /// Crash recovery: a previous session may have died with the physical monitor still removed

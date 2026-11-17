@@ -44,6 +44,9 @@ public partial class MainWindow : Window, IHidingUi
             window.ShowDialog();
             _viewModel.RefreshLicenseStatus();
         };
+        _viewModel.LicenseExpired += (_, _) =>
+            MessageBox.Show(LicenseService.NotLicensedMessage, "DesktopSplitter",
+                MessageBoxButton.OK, MessageBoxImage.Warning);
         _viewModel.StatusAppended += (_, _) => Dispatcher.BeginInvoke(new Action(() => StatusBox.ScrollToEnd()));
 
         _viewModel.Hiding.AttachUi(this);
