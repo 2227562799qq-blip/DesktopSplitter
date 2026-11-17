@@ -74,12 +74,16 @@ public sealed class MainViewModel : ObservableObject
         AppendStatus("就绪。");
         AppendStatus("授权状态：" + _licenseStatus.DisplayText);
 
-        // Re-check the license while the app stays open: without this, a license that
-        // expires mid-session would silently keep working until the next restart, and
-        // the customer would never come back to renew. Every 5 minutes the status is
+        // Re-check the license once a day at local midnight: without this, a license
+        // that expires mid-session would silently keep working until the next restart,
+        // and the customer would never come back to renew. On each tick the status is
         // re-read; a fresh expiry drops a live split and notifies once.
-        _licenseTimer = new DispatcherTimer { Interval = TimeSpan.FromMinutes(5) };
-        _licenseTimer.Tick += async (_, _) => await CheckLicenseAsync().ConfigureAwait(true);
+        _licenseTimer = new DispatcherTimer { Interval = TimeUntilMidnight() };
+        _licenseTimer.Tick += async (_, _) =>
+        {
+            _licenseTimer.Interval = TimeSpan.FromHours(24);
+            await CheckLicenseAsync().ConfigureAwait(true);
+        };
         _licenseTimer.Start();
 
         // If a previous session died while the physical monitor was hidden, put it back.
@@ -342,6 +346,13 @@ public sealed class MainViewModel : ObservableObject
         OnPropertyChanged(nameof(LicenseStatusText));
         OnPropertyChanged(nameof(IsLicensedOrTrial));
         RaiseCommandStates();
+    }
+
+    /// <summary>Time from now until the next local midnight (the license re-check moment).</summary>
+    private static TimeSpan TimeUntilMidnight()
+    {
+        TimeSpan until = DateTime.Today.AddDays(1) - DateTime.Now;
+        return until <= TimeSpan.Zero ? TimeSpan.FromHours(24) : until;
     }
 
     /// <summary>
