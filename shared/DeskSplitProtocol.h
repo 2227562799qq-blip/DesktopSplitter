@@ -24,6 +24,11 @@ DEFINE_GUID(GUID_DEVINTERFACE_DESKSPLIT,
 #define DESKSPLIT_MAX_MONITORS      4
 #define DESKSPLIT_MAX_MODES         8   // per monitor
 
+// Cap on DESKSPLIT_CONFIG.Generation: the app wraps to 1 past this (it never
+// gets there in practice — one generation per apply). The driver rejects
+// anything larger so a corrupt config cannot wrap the EDID serial.
+#define DESKSPLIT_MAX_GENERATION    10000000u
+
 #define DESKSPLIT_PROTOCOL_VERSION  1
 
 // IOCTLs (FILE_DEVICE_UNKNOWN, METHOD_BUFFERED, FILE_ANY_ACCESS)
@@ -52,6 +57,17 @@ typedef struct DESKSPLIT_CONFIG {
     uint32_t                 Version;                // DESKSPLIT_PROTOCOL_VERSION
     uint32_t                 MonitorCount;           // 0..DESKSPLIT_MAX_MONITORS
     DESKSPLIT_MONITOR_CONFIG Monitors[DESKSPLIT_MAX_MONITORS];
+    // 0.6.7: per-apply identity generation. The driver stamps each monitor's
+    // EDID serial as DESKSPLIT_EDID_SERIAL_BASE + Generation *
+    // DESKSPLIT_MAX_MONITORS + monitor index, so every apply presents Windows
+    // with monitors it has never seen before. Windows remembers a monitor
+    // set's topology (active vs disconnected) keyed by manufacturer + product
+    // code + serial; the fixed serials of <= 0.6.6 meant a set once recorded
+    // as disconnected came back disconnected on every later apply, and
+    // ChangeDisplaySettingsEx cannot arrange a monitor whose path is not
+    // active. Generation 0 reproduces the old fixed serials. Appended only:
+    // older drivers/apps keep parsing the fields above it.
+    uint32_t                 Generation;
 } DESKSPLIT_CONFIG;
 
 // Output buffer for IOCTL_DESKSPLIT_GET_STATUS.

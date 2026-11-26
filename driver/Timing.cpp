@@ -113,6 +113,13 @@ bool DeskSplitIsConfigValid(const DESKSPLIT_CONFIG& Config)
     {
         return false;
     }
+    // The serial is stamped as base + Generation * DESKSPLIT_MAX_MONITORS +
+    // index; a generation past this cap could wrap the 32-bit serial into
+    // another generation's range.
+    if (Config.Generation > DESKSPLIT_MAX_GENERATION)
+    {
+        return false;
+    }
 
     for (UINT32 MonitorIndex = 0; MonitorIndex < Config.MonitorCount; ++MonitorIndex)
     {

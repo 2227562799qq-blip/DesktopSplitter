@@ -47,6 +47,14 @@ public struct DESKSPLIT_CONFIG
 
     [MarshalAs(UnmanagedType.ByValArray, SizeConst = DriverClient.DESKSPLIT_MAX_MONITORS)]
     public DESKSPLIT_MONITOR_CONFIG[] Monitors;
+
+    /// <summary>
+    /// 0.6.7: per-apply identity generation (see shared/DeskSplitProtocol.h).
+    /// The driver stamps the EDID serial as 0xD5000001 + Generation * 4 + index,
+    /// so each apply looks like brand-new monitors to Windows. 0 = the legacy
+    /// fixed serials of 0.6.6 and earlier. Appended only.
+    /// </summary>
+    public uint Generation;
 }
 
 [StructLayout(LayoutKind.Sequential, Pack = 4)]
@@ -104,6 +112,7 @@ public static class DriverClient
             Version = DESKSPLIT_PROTOCOL_VERSION,
             MonitorCount = 0,
             Monitors = new DESKSPLIT_MONITOR_CONFIG[DESKSPLIT_MAX_MONITORS],
+            Generation = 0,
         };
         for (int i = 0; i < DESKSPLIT_MAX_MONITORS; i++)
         {

@@ -16,6 +16,11 @@ internal static class NativeMethods
 
     internal const int ERROR_SUCCESS = 0;
     internal const int ERROR_INSUFFICIENT_BUFFER = 122;
+    internal const int ERROR_FILE_NOT_FOUND = 2;
+    internal const int ERROR_GEN_FAILURE = 31;
+    internal const int ERROR_NOT_SUPPORTED = 50;
+    internal const int ERROR_INVALID_PARAMETER = 87;
+    internal const int ERROR_BAD_CONFIGURATION = 1610;
 
     [StructLayout(LayoutKind.Sequential)]
     internal struct LUID
@@ -246,6 +251,38 @@ internal static class NativeMethods
 
     [DllImport("user32.dll", ExactSpelling = true, CharSet = CharSet.Unicode)]
     internal static extern int DisplayConfigGetDeviceInfo(ref DISPLAYCONFIG_ADAPTER_NAME requestPacket);
+
+    // ---------------------------------------------------------------- SetDisplayConfig (CCD)
+
+    // Flags for SetDisplayConfig (winuser.h, verified against MSDN). Either
+    // SDC_USE_SUPPLIED_DISPLAY_CONFIG or one SDC_TOPOLOGY_XXX flag must be set,
+    // never both; SDC_SAVE_TO_DATABASE is only valid with
+    // SDC_USE_SUPPLIED_DISPLAY_CONFIG.
+    internal const uint SDC_TOPOLOGY_INTERNAL = 0x00000001;
+    internal const uint SDC_TOPOLOGY_CLONE = 0x00000002;
+    internal const uint SDC_TOPOLOGY_EXTEND = 0x00000004;
+    internal const uint SDC_TOPOLOGY_EXTERNAL = 0x00000008;
+    internal const uint SDC_TOPOLOGY_SUPPLIED = 0x00000010;
+    internal const uint SDC_USE_SUPPLIED_DISPLAY_CONFIG = 0x00000020;
+    internal const uint SDC_VALIDATE = 0x00000040;
+    internal const uint SDC_APPLY = 0x00000080;
+    internal const uint SDC_NO_OPTIMIZATION = 0x00000100;
+    internal const uint SDC_SAVE_TO_DATABASE = 0x00000200;
+    internal const uint SDC_ALLOW_CHANGES = 0x00000400;
+    internal const uint SDC_PATH_PERSIST_IF_REQUIRED = 0x00000800;
+    internal const uint SDC_FORCE_MODE_ENUMERATION = 0x00001000;
+    internal const uint SDC_ALLOW_PATH_ORDER_CHANGES = 0x00002000;
+
+    /// <summary>
+    /// Modifies the display topology, source, and target modes by exclusively
+    /// enabling the specified paths. A null array marshals as NULL (used for
+    /// the topology-only calls that take no arrays).
+    /// </summary>
+    [DllImport("user32.dll", ExactSpelling = true)]
+    internal static extern int SetDisplayConfig(
+        uint numPathArrayElements, DISPLAYCONFIG_PATH_INFO[]? pathArray,
+        uint numModeInfoArrayElements, DISPLAYCONFIG_MODE_INFO[]? modeInfoArray,
+        uint flags, IntPtr reserved);
 
     // ---------------------------------------------------------------- DEVMODE / ChangeDisplaySettingsEx
 

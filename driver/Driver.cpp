@@ -635,7 +635,11 @@ NTSTATUS IndirectDeviceContext::ApplyConfig(const DESKSPLIT_CONFIG& Config, bool
         }
 
         const bool Wanted = (Index < Config.MonitorCount);
+        // A generation change means a new EDID serial even when the mode list
+        // is identical, so the monitor has to be re-plugged for Windows to see
+        // the new identity (see DESKSPLIT_CONFIG.Generation).
         const bool Same = Wanted &&
+            (m_Slots[Index].Generation == Config.Generation) &&
             (memcmp(&m_Slots[Index].Config, &Config.Monitors[Index], sizeof(DESKSPLIT_MONITOR_CONFIG)) == 0);
 
         if (!Same)
@@ -657,7 +661,7 @@ NTSTATUS IndirectDeviceContext::ApplyConfig(const DESKSPLIT_CONFIG& Config, bool
             continue;
         }
 
-        NTSTATUS Status = CreateMonitorLocked(Index, Config.Monitors[Index]);
+        NTSTATUS Status = CreateMonitorLocked(Index, Config.Monitors[Index], Config.Generation);
         if (!NT_SUCCESS(Status))
         {
             DS_ERROR("Failed to create monitor %u: 0x%08X", Index, Status);
@@ -696,7 +700,7 @@ void IndirectDeviceContext::GetStatus(DESKSPLIT_STATUS* pStatus)
 }
 
 _Use_decl_annotations_
-NTSTATUS IndirectDeviceContext::CreateMonitorLocked(UINT32 MonitorIndex, const DESKSPLIT_MONITOR_CONFIG& Config)
+NTSTATUS IndirectDeviceContext::CreateMonitorLocked(UINT32 MonitorIndex, const DESKSPLIT_MONITOR_CONFIG& Config, UINT32 Generation)
 {
     if (MonitorIndex >= DESKSPLIT_MAX_MONITORS)
     {
@@ -709,7 +713,7 @@ NTSTATUS IndirectDeviceContext::CreateMonitorLocked(UINT32 MonitorIndex, const D
 
     MonitorSlot& Slot = m_Slots[MonitorIndex];
 
-    if (!DeskSplitBuildEdid(MonitorIndex, Config, Slot.Edid))
+    if (!DeskSplitBuildEdid(MonitorIndex, Generation, Config, Slot.Edid))
     {
         RecordLastError(DESKSPLIT_STAGE_MONITOR_CREATE, STATUS_INVALID_PARAMETER);
         return STATUS_INVALID_PARAMETER;
@@ -776,13 +780,15 @@ NTSTATUS IndirectDeviceContext::CreateMonitorLocked(UINT32 MonitorIndex, const D
     Slot.Active = true;
     Slot.Monitor = MonitorCreateOut.MonitorObject;
     Slot.Config = Config;
+    Slot.Generation = Generation;
 
-    DS_INFO("Monitor %u arrived (%ux%u @ %u mHz, %u mode(s))",
+    DS_INFO("Monitor %u arrived (%ux%u @ %u mHz, %u mode(s), generation %u)",
         MonitorIndex,
         Config.Modes[Config.PreferredModeIndex].Width,
         Config.Modes[Config.PreferredModeIndex].Height,
         Config.Modes[Config.PreferredModeIndex].RefreshMillihertz,
-        Config.ModeCount);
+        Config.ModeCount,
+        Generation);
 
     return STATUS_SUCCESS;
 }
@@ -806,6 +812,7 @@ NTSTATUS IndirectDeviceContext::RemoveMonitorLocked(UINT32 MonitorIndex)
     Slot.Active = false;
     Slot.Monitor = nullptr;
     ZeroMemory(&Slot.Config, sizeof(Slot.Config));
+    Slot.Generation = 0;
     ZeroMemory(Slot.Edid, sizeof(Slot.Edid));
 
     // IddCx destroys the IDDCX_MONITOR object as part of the departure; the

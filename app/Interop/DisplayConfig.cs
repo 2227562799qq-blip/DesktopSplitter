@@ -20,13 +20,21 @@ public static class DisplayConfig
     public const string DeskSplitEdidManufacturer = "DSP";
 
     /// <summary>
-    /// EDID serial the driver stamps for monitor index 0; index N gets
-    /// <c>DeskSplitSerialBase + N</c> (and product code N).
+    /// EDID serial the driver stamps for monitor index 0 at generation 0;
+    /// generation G stamps index N as
+    /// <c>DeskSplitSerialBase + G * DESKSPLIT_MAX_MONITORS + N</c> (and product
+    /// code N). The low bits still carry the monitor index.
     /// </summary>
     public const uint DeskSplitSerialBase = 0xD5000001;
 
-    /// <summary>Highest serial the driver can stamp (DESKSPLIT_MAX_MONITORS monitors).</summary>
-    public static uint DeskSplitSerialMax => DeskSplitSerialBase + DriverClient.DESKSPLIT_MAX_MONITORS - 1;
+    /// <summary>
+    /// Highest generation the driver accepts (must match DESKSPLIT_MAX_GENERATION
+    /// in shared/DeskSplitProtocol.h). The app wraps to 1 past this.
+    /// </summary>
+    public const uint DeskSplitMaxGeneration = 10000000;
+
+    /// <summary>Highest serial the driver can stamp (any generation, any index).</summary>
+    public static uint DeskSplitSerialMax => DeskSplitSerialBase + DeskSplitMaxGeneration * (uint)DriverClient.DESKSPLIT_MAX_MONITORS - 1;
 
     private static readonly string[] AdapterMarkers =
     {
@@ -45,7 +53,11 @@ public static class DisplayConfig
 
     /// <summary>Driver monitor index from a stamped EDID, or -1.</summary>
     public static int DeskSplitIndexFromEdid(EdidInfo? edid)
-        => IsDeskSplitEdid(edid) ? (int)(edid!.SerialNumber - DeskSplitSerialBase) : -1;
+        => IsDeskSplitEdid(edid) ? (int)((edid!.SerialNumber - DeskSplitSerialBase) % (uint)DriverClient.DESKSPLIT_MAX_MONITORS) : -1;
+
+    /// <summary>Apply generation from a stamped EDID, or -1.</summary>
+    public static int DeskSplitGenerationFromEdid(EdidInfo? edid)
+        => IsDeskSplitEdid(edid) ? (int)((edid!.SerialNumber - DeskSplitSerialBase) / (uint)DriverClient.DESKSPLIT_MAX_MONITORS) : -1;
 
     /// <summary>
     /// Enumerate every active monitor. Entries created by our own virtual driver are

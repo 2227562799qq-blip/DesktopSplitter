@@ -125,6 +125,9 @@ public static class ApplyService
 
     public static string ConfigPath => Path.Combine(ConfigDirectory, "config.json");
 
+    /// <summary>Display-generation counter: %ProgramData%\DesktopSplitter\generation.json</summary>
+    public static string GenerationPath => Path.Combine(ConfigDirectory, "generation.json");
+
     // ------------------------------------------------------------------ apply
 
     /// <summary>
@@ -205,6 +208,165 @@ public static class ApplyService
     internal static uint RoundRefreshMillihertzToWholeHertz(uint millihertz)
         => (uint)Math.Round(millihertz / 1000.0, MidpointRounding.AwayFromZero) * 1000u;
 
+    /// <summary>
+    /// Claims the next display-generation counter for one apply and persists it
+    /// (generation.json next to config.json / license.json). The counter only
+    /// ever increases, and it survives reboots: a generation Windows once
+    /// recorded as "disconnected" must never be stamped again, or the next
+    /// apply restores the same disconnected topology. Generation 0 is the
+    /// legacy fixed serials (0.6.6 and earlier); the first 0.6.7 apply claims 1.
+    /// </summary>
+    internal static uint ClaimNextDisplayGeneration(IProgress<string>? log = null)
+    {
+        uint last = ReadDisplayGeneration();
+        uint next = last >= DisplayConfig.DeskSplitMaxGeneration ? 1u : last + 1u;
+        if (next == 1u && last != 0)
+        {
+            log?.Report("显示器世代计数已达上限，已从 1 重新开始（旧身份可能被系统认出）。");
+        }
+        WriteDisplayGeneration(next);
+        return next;
+    }
+
+    private static uint ReadDisplayGeneration()
+    {
+        try
+        {
+            if (!File.Exists(GenerationPath)) return 0;
+            using JsonDocument doc = JsonDocument.Parse(File.ReadAllText(GenerationPath));
+            if (doc.RootElement.TryGetProperty("generation", out JsonElement element) &&
+                element.ValueKind == JsonValueKind.Number &&
+                element.TryGetUInt32(out uint value))
+            {
+                return value;
+            }
+            return 0;
+        }
+        catch
+        {
+            return 0;
+        }
+    }
+
+    private static void WriteDisplayGeneration(uint generation)
+    {
+        try
+        {
+            Directory.CreateDirectory(ConfigDirectory);
+            File.WriteAllText(GenerationPath, JsonSerializer.Serialize(new { generation }, JsonOptions));
+        }
+        catch (Exception ex) when (ex is UnauthorizedAccessException or System.Security.SecurityException)
+        {
+            throw new ApplyException(
+                $"写入 {GenerationPath} 时被拒绝访问。{Environment.NewLine}" +
+                "请以管理员身份运行一次 DesktopSplitter——它会创建 " +
+                $"{ConfigDirectory} 并授予当前用户写入权限；" +
+                "之后运行不再需要提权。", ex);
+        }
+        catch (IOException ex)
+        {
+            throw new ApplyException($"无法写入 {GenerationPath}：{ex.Message}", ex);
+        }
+    }
+
+    /// <summary>
+    /// Pure config construction for one apply: one mode per segment, refresh
+    /// rounded to whole hertz (see RoundRefreshMillihertzToWholeHertz), and the
+    /// claimed generation stamped on the whole config.
+    /// </summary>
+    internal static DESKSPLIT_CONFIG BuildDriverConfig(
+        MonitorInfo physical, LayoutDefinition layout,
+        IReadOnlyList<(int Width, int Height)> resolutions, uint generation)
+    {
+        int segmentCount = layout.SegmentCount;
+        DESKSPLIT_CONFIG cfg = DriverClient.NewConfig();
+        cfg.MonitorCount = (uint)segmentCount;
+        cfg.Generation = generation;
+        // The driver reports this exact rate as each virtual monitor's only mode, so
+        // it must be a rate the OS can actually set — see
+        // RoundRefreshMillihertzToWholeHertz. A fractional rate here (e.g. 60020 mHz)
+        // made the arrange step fail with DISP_CHANGE_BADMODE on every attempt.
+        uint driverRefreshMillihertz =
+            RoundRefreshMillihertzToWholeHertz(physical.MaxRefreshMillihertz);
+        for (int i = 0; i < segmentCount; i++)
+        {
+            (int w, int h) = resolutions[i];
+            cfg.Monitors[i].ModeCount = 1;
+            cfg.Monitors[i].PreferredModeIndex = 0;
+            cfg.Monitors[i].Modes[0] = new DESKSPLIT_MODE
+            {
+                Width = (uint)w,
+                Height = (uint)h,
+                RefreshMillihertz = driverRefreshMillihertz,
+            };
+        }
+        return cfg;
+    }
+
+    /// <summary>
+    /// The monitor-creation half of an apply (steps a–b of ApplyCore), factored
+    /// out so the self-test can create monitors with a CHOSEN generation: the
+    /// inactive-repro phase creates the same generation twice, to prove Windows
+    /// remembers the first set as disconnected. Production always passes
+    /// <c>generationOverride: null</c> and claims a fresh generation.
+    /// </summary>
+    internal static IReadOnlyList<MonitorInfo> CreateVirtualMonitors(
+        ApplyRequest request, HashSet<string> baseline,
+        IProgress<string> log, CancellationToken ct, uint? generationOverride = null)
+    {
+        int segmentCount = request.Layout.SegmentCount;
+        uint generation = generationOverride ?? ClaimNextDisplayGeneration(log);
+
+        // Virtual monitors that already exist before this apply. Stale entries
+        // from earlier attempts stay in the display database with our EDID
+        // cached, and QDC_ALL_PATHS still lists them — the wait must count
+        // only monitors this apply creates, or it sees 4 when it wants 2.
+        var virtualBaseline = DisplayConfig.EnumerateAll()
+            .Where(m => m.IsDeskSplitVirtual)
+            .Select(m => m.DeviceName)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        log.Report(virtualBaseline.Count == 0
+            ? "点应用前没有已存在的虚拟显示器。"
+            : $"点应用前已有虚拟显示器 {virtualBaseline.Count} 台：{string.Join("、", virtualBaseline.OrderBy(n => DisplayConfig.DeviceIndex(n)))}。");
+
+        // a. Build and send DESKSPLIT_CONFIG.
+        DESKSPLIT_CONFIG cfg = BuildDriverConfig(request.Physical, request.Layout, request.Resolutions, generation);
+        uint driverRefreshMillihertz = cfg.Monitors[0].Modes[0].RefreshMillihertz;
+        log.Report($"发送 IOCTL_DESKSPLIT_SET_CONFIG（0x{DriverClient.IOCTL_DESKSPLIT_SET_CONFIG:X8}）：" +
+                   $"{segmentCount} 台显示器，{driverRefreshMillihertz} mHz" +
+                   (driverRefreshMillihertz == request.Physical.MaxRefreshMillihertz
+                       ? "……"
+                       : $"（物理屏实测 {request.Physical.MaxRefreshMillihertz} mHz，已取整为整赫兹）……") +
+                   $" 世代 {generation}。");
+        try
+        {
+            DriverClient.SetConfig(cfg);
+        }
+        catch (DriverNotFoundException ex)
+        {
+            throw new ApplyException(ex.Message, ex);
+        }
+        catch (DriverIoException ex)
+        {
+            throw new ApplyException(ex.Message, ex);
+        }
+
+        // b. Wait for the virtual monitors to arrive.
+        log.Report($"等待 {segmentCount} 台虚拟显示器出现（最多 {MonitorArrivalTimeout.TotalSeconds:0} 秒）……");
+        IReadOnlyList<MonitorInfo> arrived = WaitForVirtualMonitors(segmentCount, virtualBaseline, log, ct);
+        foreach (MonitorInfo m in arrived)
+        {
+            log.Report($"  找到 {m.DeviceName}（{m.FriendlyName}）" +
+                       (m.Edid is null ? "  [无 EDID]" : $"  [{m.Edid}]") +
+                       (m.IsActivePath ? string.Empty : "  [路径未激活，排列时激活]"));
+        }
+
+        // Map segment i -> the monitor the driver created as DESKSPLIT_CONFIG.Monitors[i],
+        // identified by the EDID serial the driver stamps
+        // (0xD5000001 + generation * 4 + index; the index is the serial's low bits).
+        return MapSegmentsToMonitors(baseline, arrived, segmentCount, log, ct);
+    }
+
     private static ApplyResult ApplyCore(
         ApplyRequest request, IProgress<string> log, CancellationToken ct, out AppliedSnapshot snapshot)
     {
@@ -232,75 +394,14 @@ public static class ApplyService
             .Select(m => m.DeviceName)
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
-        // Virtual monitors that already exist before this apply. Stale entries
-        // from earlier attempts stay in the display database with our EDID
-        // cached, and QDC_ALL_PATHS still lists them — the wait must count
-        // only monitors this apply creates, or it sees 4 when it wants 2.
-        var virtualBaseline = DisplayConfig.EnumerateAll()
-            .Where(m => m.IsDeskSplitVirtual)
-            .Select(m => m.DeviceName)
-            .ToHashSet(StringComparer.OrdinalIgnoreCase);
-        log.Report(virtualBaseline.Count == 0
-            ? "点应用前没有已存在的虚拟显示器。"
-            : $"点应用前已有虚拟显示器 {virtualBaseline.Count} 台：{string.Join("、", virtualBaseline.OrderBy(n => DisplayConfig.DeviceIndex(n)))}。");
-
         // Remember which display was primary BEFORE we touch anything — Revert restores
         // exactly this monitor, which is not necessarily the one being split.
         (string previousPrimaryDevice, string previousPrimaryName) = CapturePreviousPrimary(before, log);
 
-        // a. Build and send DESKSPLIT_CONFIG.
-        DESKSPLIT_CONFIG cfg = DriverClient.NewConfig();
-        cfg.MonitorCount = (uint)segmentCount;
-        // The driver reports this exact rate as each virtual monitor's only mode, so
-        // it must be a rate the OS can actually set — see
-        // RoundRefreshMillihertzToWholeHertz. A fractional rate here (e.g. 60020 mHz)
-        // made the arrange step fail with DISP_CHANGE_BADMODE on every attempt.
-        uint driverRefreshMillihertz =
-            RoundRefreshMillihertzToWholeHertz(physical.MaxRefreshMillihertz);
-        for (int i = 0; i < segmentCount; i++)
-        {
-            (int w, int h) = request.Resolutions[i];
-            cfg.Monitors[i].ModeCount = 1;
-            cfg.Monitors[i].PreferredModeIndex = 0;
-            cfg.Monitors[i].Modes[0] = new DESKSPLIT_MODE
-            {
-                Width = (uint)w,
-                Height = (uint)h,
-                RefreshMillihertz = driverRefreshMillihertz,
-            };
-        }
-
-        log.Report($"发送 IOCTL_DESKSPLIT_SET_CONFIG（0x{DriverClient.IOCTL_DESKSPLIT_SET_CONFIG:X8}）：" +
-                   $"{segmentCount} 台显示器，{driverRefreshMillihertz} mHz" +
-                   (driverRefreshMillihertz == physical.MaxRefreshMillihertz
-                       ? "……"
-                       : $"（物理屏实测 {physical.MaxRefreshMillihertz} mHz，已取整为整赫兹）……"));
-        try
-        {
-            DriverClient.SetConfig(cfg);
-        }
-        catch (DriverNotFoundException ex)
-        {
-            throw new ApplyException(ex.Message, ex);
-        }
-        catch (DriverIoException ex)
-        {
-            throw new ApplyException(ex.Message, ex);
-        }
-
-        // b. Wait for the virtual monitors to arrive.
-        log.Report($"等待 {segmentCount} 台虚拟显示器出现（最多 {MonitorArrivalTimeout.TotalSeconds:0} 秒）……");
-        IReadOnlyList<MonitorInfo> arrived = WaitForVirtualMonitors(segmentCount, virtualBaseline, log, ct);
-        foreach (MonitorInfo m in arrived)
-        {
-            log.Report($"  找到 {m.DeviceName}（{m.FriendlyName}）" +
-                       (m.Edid is null ? "  [无 EDID]" : $"  [{m.Edid}]") +
-                       (m.IsActivePath ? string.Empty : "  [路径未激活，排列时激活]"));
-        }
-
-        // Map segment i -> the monitor the driver created as DESKSPLIT_CONFIG.Monitors[i],
-        // identified by the EDID serial the driver stamps (0xD5000001 + index).
-        IReadOnlyList<MonitorInfo> virtualMonitors = MapSegmentsToMonitors(baseline, arrived, segmentCount, log, ct);
+        // a–b. Build + send DESKSPLIT_CONFIG, wait for arrival, map segments to
+        // monitors (see CreateVirtualMonitors; production claims a fresh
+        // generation every apply).
+        IReadOnlyList<MonitorInfo> virtualMonitors = CreateVirtualMonitors(request, baseline, log, ct);
 
         // c. Arrange them contiguously to the right of the physical monitor and promote
         //    segment 1's virtual monitor to PRIMARY, in one batch. The shell anchors the Start

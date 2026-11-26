@@ -131,7 +131,7 @@ namespace DesktopSplitter
         void GetStatus(_Out_ DESKSPLIT_STATUS* pStatus);
 
     private:
-        NTSTATUS CreateMonitorLocked(_In_ UINT32 MonitorIndex, _In_ const DESKSPLIT_MONITOR_CONFIG& Config);
+        NTSTATUS CreateMonitorLocked(_In_ UINT32 MonitorIndex, _In_ const DESKSPLIT_MONITOR_CONFIG& Config, _In_ UINT32 Generation);
         NTSTATUS RemoveMonitorLocked(_In_ UINT32 MonitorIndex);
 
         NTSTATUS LoadPersistedConfig(_Out_ DESKSPLIT_CONFIG* pConfig);
@@ -142,6 +142,10 @@ namespace DesktopSplitter
             bool Active;
             IDDCX_MONITOR Monitor;
             DESKSPLIT_MONITOR_CONFIG Config;
+            // Generation the slot's EDID serial was stamped with (0.6.7): a
+            // config with a different generation must re-plug the monitor even
+            // when the mode list is identical.
+            UINT32 Generation;
             BYTE Edid[DESKSPLIT_EDID_SIZE];
         };
 

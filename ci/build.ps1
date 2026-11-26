@@ -239,8 +239,11 @@ if (-not $failAt) {
         # monitors), and that is exactly where 0.6.4 failed on the target PC
         # (mode rejected for both virtual monitors). Run the app headless with
         # --self-test-apply: real ApplyService.Apply for a 2-way split, then
-        # topology verification and Revert. The driver is still installed here;
-        # the finally block below uninstalls it.
+        # topology verification and Revert, then the 0.6.7 inactive-repro phase
+        # (disconnect -> revert -> re-create the same generation -> old arrange
+        # must fail BADMODE, then a fresh generation must auto-activate and
+        # arrange). The driver is still installed here; the finally block below
+        # uninstalls it.
         Write-Host 'APPLY-TEST: running the real apply headlessly (DesktopSplitter.exe --self-test-apply)...'
         $appExeT = 'app\\bin\\Release\\net8.0-windows\\DesktopSplitter.exe'
         if (-not (Test-Path $appExeT)) { throw "app exe not found: $appExeT" }
@@ -251,7 +254,7 @@ if (-not $failAt) {
         Write-Host "APPLY-TEST: app exit code = $($applyProcT.ExitCode)"
         if ($applyProcT.ExitCode -eq 2) { Write-Host 'APPLY-TEST: SKIPPED - physical display too small for a 2-way split' }
         elseif ($applyProcT.ExitCode -ne 0) { throw "headless apply self-test failed (exit $($applyProcT.ExitCode))" }
-        Write-Host 'APPLY-TEST: PASSED - real apply (arrange + revert) works'
+        Write-Host 'APPLY-TEST: PASSED - real apply (arrange + inactive-repro + rotation + revert) works'
     } catch {
         Write-Host "SELF-TEST FAILED: $($_.Exception.Message)"
         $failAt = 'self-test'

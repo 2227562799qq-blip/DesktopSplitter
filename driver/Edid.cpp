@@ -146,7 +146,7 @@ namespace
 }
 
 _Use_decl_annotations_
-bool DeskSplitBuildEdid(UINT32 MonitorIndex, const DESKSPLIT_MONITOR_CONFIG& Config, BYTE* pEdid)
+bool DeskSplitBuildEdid(UINT32 MonitorIndex, UINT32 Generation, const DESKSPLIT_MONITOR_CONFIG& Config, BYTE* pEdid)
 {
     if (pEdid == nullptr || MonitorIndex >= DESKSPLIT_MAX_MONITORS)
     {
@@ -247,8 +247,11 @@ bool DeskSplitBuildEdid(UINT32 MonitorIndex, const DESKSPLIT_MONITOR_CONFIG& Con
     pEdid[10] = static_cast<BYTE>(ProductCode & 0xFF);
     pEdid[11] = static_cast<BYTE>((ProductCode >> 8) & 0xFF);
 
-    // Serial number, unique per monitor index (little endian).
-    const UINT32 SerialNumber = 0xD5000001u + MonitorIndex;
+    // Serial number, unique per monitor index AND per apply generation
+    // (little endian). The generation occupies the bits above the index, so
+    // the low bits still carry the monitor index.
+    const UINT32 SerialNumber = DESKSPLIT_EDID_SERIAL_BASE +
+        Generation * static_cast<UINT32>(DESKSPLIT_MAX_MONITORS) + MonitorIndex;
     pEdid[12] = static_cast<BYTE>(SerialNumber & 0xFF);
     pEdid[13] = static_cast<BYTE>((SerialNumber >> 8) & 0xFF);
     pEdid[14] = static_cast<BYTE>((SerialNumber >> 16) & 0xFF);
