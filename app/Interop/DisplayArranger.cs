@@ -277,7 +277,7 @@ public static class DisplayArranger
                     {
                         width = (uint)p.Width,
                         height = (uint)p.Height,
-                        pixelFormat = 32,
+                        pixelFormat = DISPLAYCONFIG_PIXELFORMAT_32BPP,
                         position = new POINTL { x = p.X, y = p.Y },
                     },
                 },

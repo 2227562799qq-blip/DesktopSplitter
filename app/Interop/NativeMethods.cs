@@ -145,6 +145,7 @@ internal static class NativeMethods
 
     internal const uint DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE = 1;
     internal const uint DISPLAYCONFIG_MODE_INFO_TYPE_TARGET = 2;
+    internal const uint DISPLAYCONFIG_PIXELFORMAT_32BPP = 4;
 
     [StructLayout(LayoutKind.Sequential)]
     internal struct DISPLAYCONFIG_MODE_INFO
