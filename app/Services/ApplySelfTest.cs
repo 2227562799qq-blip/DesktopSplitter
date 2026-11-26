@@ -223,10 +223,10 @@ public static class ApplySelfTest
             .FirstOrDefault();
         if (target is null) return false;
 
-        DEVMODE dm = target.Value;
-        log.Report($"APPLY-SELF-TEST: widening physical display to {dm.dmPelsWidth}x{dm.dmPelsHeight} " +
+        DEVMODE chosen = target.Value;
+        log.Report($"APPLY-SELF-TEST: widening physical display to {chosen.dmPelsWidth}x{chosen.dmPelsHeight} " +
                    $"for the split (was {physical.CurrentWidth}x{physical.CurrentHeight}).");
-        int rc = ChangeDisplaySettingsEx(physical.DeviceName, ref dm, IntPtr.Zero, 0, IntPtr.Zero);
+        int rc = ChangeDisplaySettingsEx(physical.DeviceName, ref chosen, IntPtr.Zero, 0, IntPtr.Zero);
         if (rc != DISP_CHANGE_SUCCESSFUL)
         {
             log.Report($"APPLY-SELF-TEST: widening failed (rc {rc}).");
