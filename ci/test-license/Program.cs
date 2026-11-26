@@ -45,7 +45,7 @@ string good = SignCode("{\"exp\":\"2030-06-01\",\"mac\":\"AA-BB-CC-DD-EE-FF\"}",
 LicenseService.CodeResult roundTrip = LicenseService.VerifyCode(good, pubB64, macs);
 Check("c# sign/verify round-trip", roundTrip.Verification == LicenseService.CodeVerification.Valid);
 
-string tampered = good[..^1] + (good[^1] == 'A' ? 'B' : 'A');
+string tampered = good[..^1] + (good[^1] == 'A' ? 'Q' : 'A');
 Check("tampered code rejected",
     LicenseService.VerifyCode(tampered, pubB64, macs).Verification == LicenseService.CodeVerification.BadSignature);
 
