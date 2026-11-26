@@ -250,7 +250,13 @@ public static class ApplySelfTest
     ///    detach) so Windows records those identities as disconnected, then
     ///    Revert to remove them.
     /// 3. Create the SAME generation again and confirm the monitors arrive
-    ///    INACTIVE and stay inactive for 5 s — the remembered topology.
+    ///    INACTIVE and stay inactive for 15 s — the remembered topology.
+    ///    The re-arrived monitors are identified by DISPLAY number (the
+    ///    highest numbers are the newest arrivals), not by EDID/target
+    ///    identity: after a disconnect + revert every path resolves to the
+    ///    same EDID, so identity dedup cannot separate the new monitors
+    ///    from the stale path records (round 3 proved this: all four paths
+    ///    decoded to serial 0xD5000009, index 0).
     /// 4. Run the OLD ChangeDisplaySettingsEx arrange on them and require it
     ///    to fail exactly like on lu's machine (BADMODE / FAILED).
     /// 5. Revert, then run a full Apply (which claims a FRESH generation) and
@@ -326,8 +332,17 @@ public static class ApplySelfTest
                 IReadOnlyList<MonitorInfo> second;
                 try
                 {
+                    // Identity dedup cannot work here: the re-arrived monitors
+                    // all resolve to the same EDID (round 3: all four paths
+                    // decoded to serial 0xD5000009, index 0), and the target
+                    // dedup saw the wrong number of groups too. The new
+                    // arrivals are identified by DISPLAY number instead — GDI
+                    // names are handed out in arrival order, so the stale
+                    // records keep the old numbers and the new monitors take
+                    // the highest ones.
                     second = ApplyService.CreateVirtualMonitors(
-                        request, NonVirtualBaseline(), log, CancellationToken.None, gen);
+                        request, NonVirtualBaseline(), log, CancellationToken.None, gen,
+                        newestDisplayFallback: true);
                 }
                 catch (Exception ex)
                 {
@@ -340,13 +355,13 @@ public static class ApplySelfTest
                 log.Report("INACTIVE-REPRO: re-arrived monitors carry generation " +
                            string.Join(", ", second.Select(m => DisplayConfig.DeskSplitGenerationFromEdid(m.Edid))) +
                            $" (expected {gen}).");
-                if (!StaysInactiveFor(log, secondNames, TimeSpan.FromSeconds(5)))
+                if (!StaysInactiveFor(log, secondNames, TimeSpan.FromSeconds(15)))
                 {
                     log.Report("INACTIVE-REPRO: NOT-REPRODUCED — re-arrived monitors activated.");
                     return (false, false);
                 }
                 log.Report($"INACTIVE-REPRO: inactive state confirmed — re-arrived generation {gen} " +
-                           "monitors stayed inactive for 5 s.");
+                           "monitors stayed inactive for 15 s.");
 
                 reproPassed = OldArrangeFails(log, request, second);
             }

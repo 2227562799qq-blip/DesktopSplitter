@@ -309,10 +309,17 @@ public static class ApplyService
     /// inactive-repro phase creates the same generation twice, to prove Windows
     /// remembers the first set as disconnected. Production always passes
     /// <c>generationOverride: null</c> and claims a fresh generation.
+    /// <c>newestDisplayFallback</c> is repro-only: after a disconnect + revert,
+    /// re-arrived monitors can all resolve to the same EDID, so the identity
+    /// dedup in the normal wait cannot tell the new monitors from the stale
+    /// path records; the wait then identifies the new arrivals by DISPLAY
+    /// number instead (the highest numbers are the newest arrivals).
+    /// Production never passes it.
     /// </summary>
     internal static IReadOnlyList<MonitorInfo> CreateVirtualMonitors(
         ApplyRequest request, HashSet<string> baseline,
-        IProgress<string> log, CancellationToken ct, uint? generationOverride = null)
+        IProgress<string> log, CancellationToken ct, uint? generationOverride = null,
+        bool newestDisplayFallback = false)
     {
         int segmentCount = request.Layout.SegmentCount;
         uint generation = generationOverride ?? ClaimNextDisplayGeneration(log);
@@ -353,7 +360,9 @@ public static class ApplyService
 
         // b. Wait for the virtual monitors to arrive.
         log.Report($"等待 {segmentCount} 台虚拟显示器出现（最多 {MonitorArrivalTimeout.TotalSeconds:0} 秒）……");
-        IReadOnlyList<MonitorInfo> arrived = WaitForVirtualMonitors(segmentCount, virtualBaseline, log, ct);
+        IReadOnlyList<MonitorInfo> arrived = newestDisplayFallback
+            ? WaitForVirtualMonitorsByNewestDisplay(segmentCount, virtualBaseline, log, ct)
+            : WaitForVirtualMonitors(segmentCount, virtualBaseline, log, ct);
         foreach (MonitorInfo m in arrived)
         {
             log.Report($"  找到 {m.DeviceName}（{m.FriendlyName}）" +
@@ -1267,6 +1276,78 @@ public static class ApplyService
     }
 
     /// <summary>
+    /// Repro-only wait: identifies the newly arrived virtual monitors by GDI
+    /// device number instead of by identity. After a disconnect + revert,
+    /// re-arrived monitors can all resolve to the same EDID (round 3: all
+    /// four paths decoded to serial 0xD5000009, index 0), and the target
+    /// dedup in <see cref="WaitForVirtualMonitors"/> sees the wrong number
+    /// of groups too — so neither identity rule can tell the new monitors
+    /// from the stale path records. GDI device names are handed out in
+    /// arrival order, so the stale records keep their old numbers and the
+    /// new arrivals take the highest numbers. Waits until at least
+    /// <paramref name="expected"/> new paths have arrived and the count has
+    /// been stable for 2 seconds (late paths still trickling in), then
+    /// returns the highest-numbered ones. Production never uses this: every
+    /// production apply claims a fresh generation, so its identities never
+    /// collide like this.
+    /// </summary>
+    private static IReadOnlyList<MonitorInfo> WaitForVirtualMonitorsByNewestDisplay(
+        int expected, HashSet<string> virtualBaseline, IProgress<string> log, CancellationToken ct)
+    {
+        DateTime started = DateTime.UtcNow;
+        DateTime deadline = started + MonitorArrivalTimeout;
+        List<MonitorInfo> found = new();
+        int preExisting = 0;
+        int lastCount = -1;
+        DateTime lastChange = started;
+
+        while (DateTime.UtcNow < deadline)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            List<MonitorInfo> allVirtual = SafeEnumerateAll()
+                .Where(m => m.IsDeskSplitVirtual)
+                .ToList();
+            found = allVirtual
+                .Where(m => !virtualBaseline.Contains(m.DeviceName))
+                .OrderBy(m => DisplayConfig.DeviceIndex(m.DeviceName))
+                .ThenBy(m => m.DeviceName, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+            preExisting = allVirtual.Count - found.Count;
+
+            if (found.Count != lastCount)
+            {
+                lastCount = found.Count;
+                lastChange = DateTime.UtcNow;
+            }
+
+            if (found.Count >= expected &&
+                DateTime.UtcNow - lastChange >= TimeSpan.FromSeconds(2))
+            {
+                var pickedNames = found
+                    .OrderByDescending(m => DisplayConfig.DeviceIndex(m.DeviceName))
+                    .Take(expected)
+                    .Select(m => m.DeviceName)
+                    .ToHashSet(StringComparer.OrdinalIgnoreCase);
+                var picked = found.Where(m => pickedNames.Contains(m.DeviceName)).ToList();
+                var skipped = found.Where(m => !pickedNames.Contains(m.DeviceName)).ToList();
+                log.Report($"新建的虚拟显示器 {found.Count} 台，身份去重不可用（重到货的旧身份全指同一个 EDID），" +
+                           $"已按 DISPLAY 编号取最新到货的 {expected} 台：{string.Join("、", picked.Select(m => m.DeviceName))}" +
+                           (skipped.Count == 0 ? "。" : $"；跳过残留旧路径：{string.Join("、", skipped.Select(m => m.DeviceName))}。"));
+                return picked;
+            }
+
+            ct.WaitHandle.WaitOne(PollInterval);
+        }
+
+        throw new ApplyException(
+            $"等待虚拟显示器超时（{MonitorArrivalTimeout.TotalSeconds:0} 秒）：" +
+            $"应有 {expected} 台，本次新建看到 {found.Count} 台" +
+            (preExisting > 0 ? $"（另有 {preExisting} 台以前留下的虚拟显示器未计入）" : "") +
+            $"：{DescribeMonitors(found)}。{DriverStatusText()}");
+    }
+
+    /// <summary>
     /// Picks one entry per expected EDID index (0..expected-1) out of a list
     /// that has more entries than expected. Returns false unless every index
     /// is represented. Among duplicates of one index, prefer an active path,
@@ -1350,13 +1431,17 @@ public static class ApplyService
         }
     }
 
-    /// <summary>One line per monitor for the timeout message.</summary>
+    /// <summary>One line per monitor for the timeout message. The display-config
+    /// target id (adapter LUID + target id) is printed too: after a disconnect +
+    /// revert, re-arrived paths can all resolve to the same EDID, and the target
+    /// id is what tells whether they share one target or carry distinct ones.</summary>
     private static string DescribeMonitors(IReadOnlyList<MonitorInfo> monitors)
         => monitors.Count == 0
             ? "无"
             : string.Join("；", monitors.Select(m =>
                 $"{m.DeviceName}（索引{(m.DeskSplitMonitorIndex < 0 ? "无EDID" : m.DeskSplitMonitorIndex.ToString())}" +
                 (m.Edid is null ? string.Empty : $"，{m.Edid}") +
+                $"，目标 {m.AdapterIdLow:X8}:{m.AdapterIdHigh:X8}#{m.TargetId}" +
                 $"，{(m.IsActivePath ? "已激活" : "未激活")}）"));
 
     /// <summary>
