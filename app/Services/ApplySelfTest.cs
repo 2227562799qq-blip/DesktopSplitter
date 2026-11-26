@@ -57,6 +57,30 @@ public static class ApplySelfTest
     {
         log.Report("APPLY-SELF-TEST: headless end-to-end apply (2-way split).");
 
+        // The driver reports the rate Apply sends it as the virtual monitor's only
+        // mode, and a DEVMODE can only ask for whole hertz. Guard the rounding
+        // here: the runner's physical monitor is an exact whole-hertz rate, so the
+        // end-to-end apply below can never catch a fractional-rate regression.
+        (uint input, uint expected)[] refreshCases =
+        {
+            (60020, 60000),   // 60.020 Hz panel (the failing machine)
+            (60012, 60000),
+            (59940, 60000),   // 59.94 Hz
+            (164999, 165000), // 164.999 Hz
+            (64000, 64000),   // already whole
+            (60000, 60000),
+        };
+        foreach ((uint input, uint expected) in refreshCases)
+        {
+            uint actual = ApplyService.RoundRefreshMillihertzToWholeHertz(input);
+            if (actual != expected)
+            {
+                log.Report($"APPLY-SELF-TEST: refresh rounding FAILED: {input} mHz -> {actual} mHz, expected {expected} mHz.");
+                return 1;
+            }
+        }
+        log.Report("APPLY-SELF-TEST: refresh rounding ok (60020->60000, 164999->165000, 64000->64000).");
+
         IReadOnlyList<MonitorInfo> current = DisplayConfig.Enumerate();
         MonitorInfo? physical = current.FirstOrDefault(m => m.IsPrimary && !m.IsDeskSplitVirtual)
             ?? current.FirstOrDefault(m => !m.IsDeskSplitVirtual);

@@ -194,6 +194,17 @@ public static class ApplyService
         };
     }
 
+    /// <summary>
+    /// Rounds a refresh rate to whole hertz (in millihertz). The driver reports the
+    /// rate we send it as the virtual monitor's ONLY mode, and a DEVMODE can only ask
+    /// for whole hertz (dmDisplayFrequency is an integer). A fractional physical rate
+    /// (e.g. 60020 mHz on a 60.020 Hz panel) would make that mode un-requestable:
+    /// ChangeDisplaySettingsEx then fails with DISP_CHANGE_BADMODE even on the
+    /// no-refresh retry, because Windows still resolves the request to 60 Hz.
+    /// </summary>
+    internal static uint RoundRefreshMillihertzToWholeHertz(uint millihertz)
+        => (uint)Math.Round(millihertz / 1000.0, MidpointRounding.AwayFromZero) * 1000u;
+
     private static ApplyResult ApplyCore(
         ApplyRequest request, IProgress<string> log, CancellationToken ct, out AppliedSnapshot snapshot)
     {
@@ -240,6 +251,12 @@ public static class ApplyService
         // a. Build and send DESKSPLIT_CONFIG.
         DESKSPLIT_CONFIG cfg = DriverClient.NewConfig();
         cfg.MonitorCount = (uint)segmentCount;
+        // The driver reports this exact rate as each virtual monitor's only mode, so
+        // it must be a rate the OS can actually set — see
+        // RoundRefreshMillihertzToWholeHertz. A fractional rate here (e.g. 60020 mHz)
+        // made the arrange step fail with DISP_CHANGE_BADMODE on every attempt.
+        uint driverRefreshMillihertz =
+            RoundRefreshMillihertzToWholeHertz(physical.MaxRefreshMillihertz);
         for (int i = 0; i < segmentCount; i++)
         {
             (int w, int h) = request.Resolutions[i];
@@ -249,12 +266,15 @@ public static class ApplyService
             {
                 Width = (uint)w,
                 Height = (uint)h,
-                RefreshMillihertz = physical.MaxRefreshMillihertz,
+                RefreshMillihertz = driverRefreshMillihertz,
             };
         }
 
         log.Report($"发送 IOCTL_DESKSPLIT_SET_CONFIG（0x{DriverClient.IOCTL_DESKSPLIT_SET_CONFIG:X8}）：" +
-                   $"{segmentCount} 台显示器，{physical.MaxRefreshMillihertz} mHz……");
+                   $"{segmentCount} 台显示器，{driverRefreshMillihertz} mHz" +
+                   (driverRefreshMillihertz == physical.MaxRefreshMillihertz
+                       ? "……"
+                       : $"（物理屏实测 {physical.MaxRefreshMillihertz} mHz，已取整为整赫兹）……"));
         try
         {
             DriverClient.SetConfig(cfg);
