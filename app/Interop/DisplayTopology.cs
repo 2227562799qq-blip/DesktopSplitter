@@ -17,7 +17,7 @@ public static class DisplayTopology
     /// </summary>
     public static bool TryDisconnectToInternal(IProgress<string> log)
     {
-        int rc = SetDisplayConfig(0, null, 0, null, SDC_APPLY | SDC_TOPOLOGY_INTERNAL);
+        int rc = SetDisplayConfig(0, null, 0, null, SDC_APPLY | SDC_TOPOLOGY_INTERNAL, IntPtr.Zero);
         if (rc == 0)
         {
             log.Report("SetDisplayConfig 已切到仅内屏（拓扑 INTERNAL），虚拟显示器应已断开。");
