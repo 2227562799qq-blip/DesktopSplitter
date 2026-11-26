@@ -7,15 +7,20 @@
 //   all     = QueryDisplayConfig(QDC_ALL_PATHS) path delta (monitors Windows knows)
 //   active  = QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS) path delta (monitors on the desktop)
 //
-// Pass requires all three to reach 2. The split between the three numbers is
-// the diagnosis when it fails:
+// The verdict gates on driver + active only. The all-paths count is printed
+// as a diagnostic, not a gate: QDC_ALL_PATHS counts every path in the display
+// database, including stale entries for long-gone displays (a fresh runner
+// already shows 17), and Windows may prune entries when the topology changes,
+// so the count does not move by exactly +2 even on success (run 45734589966:
+// driver=2, active=+2, all=+0 — a pass the old verdict called a failure).
+// The failure split is still the diagnosis when it fails:
 //
 //   driver 0            -> the driver never created the monitors (see
 //                          GET_STATUS AdapterReady / LastErrorStage)
-//   driver 2, all 0     -> created but the OS never saw them arrive
-//   driver 2, all 2, active 0 -> arrived but Windows never activated their
-//                          paths — this is the 2026-11-25 failure (app waited
-//                          on active paths only and reported 0 after 15 s)
+//   driver 2, active 0  -> created but Windows never activated their paths —
+//                          this is the 2026-11-25 failure (app waited on
+//                          active paths only and reported 0 after 15 s);
+//                          allDelta hints whether the OS saw them arrive
 //
 // Runs elevated (the runner is admin). Reverts with SET_CONFIG 0 at the end
 // so the machine is left clean. Exit 0 = pass, 1 = split did not complete,
@@ -102,13 +107,15 @@ internal static class Program
                 nextPrint = DateTime.UtcNow + TimeSpan.FromSeconds(2);
             }
 
-            if (driver - baseDriver == ExpectedMonitors && allDelta == ExpectedMonitors && activeDelta == ExpectedMonitors)
+            if (driver - baseDriver == ExpectedMonitors && activeDelta == ExpectedMonitors)
                 break;
 
             Thread.Sleep(500);
         }
 
-        bool pass = driver - baseDriver == ExpectedMonitors && allDelta == ExpectedMonitors && activeDelta == ExpectedMonitors;
+        // Verdict: driver created both monitors AND Windows activated both
+        // paths. allDelta is diagnostic only — see the header comment.
+        bool pass = driver - baseDriver == ExpectedMonitors && activeDelta == ExpectedMonitors;
         PrintDriverStatus("verdict");
         Console.WriteLine(pass
             ? $"SPLIT-TEST: PASSED — driver={driver} all=+{allDelta} active=+{activeDelta}."
