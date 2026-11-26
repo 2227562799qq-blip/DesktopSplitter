@@ -1203,7 +1203,11 @@ public static class ApplyService
     /// and returns one entry per index — preferring an active path, then the
     /// highest DISPLAY number (the newest arrival). The duplicate rule only
     /// applies after 2 seconds so a just-arrived monitor's EDID has time to
-    /// be cached first. On timeout the message lists every monitor found, so
+    /// be cached first. When the EDID serials alias — after a disconnect +
+    /// revert, re-arrived monitors can all resolve to the same EDID, so no
+    /// index 1 ever shows up — the wait falls back to one entry per
+    /// display-config target (adapter + target id), which still tells the
+    /// monitors apart. On timeout the message lists every monitor found, so
     /// the next failure names the extras instead of only counting them.
     /// </summary>
     private static IReadOnlyList<MonitorInfo> WaitForVirtualMonitors(
@@ -1236,6 +1240,20 @@ public static class ApplyService
             {
                 log.Report($"新建的虚拟显示器多于预期（{found.Count} 台），已按 EDID 序列号去重，重复索引取编号最大的。");
                 return deduped;
+            }
+
+            // The EDID serials can alias: after a disconnect + revert, the
+            // re-arrived monitors may all resolve to the same EDID (the
+            // display database hands every inactive path the same target's
+            // EDID), so the serial cannot tell the monitors apart and the
+            // rule above never sees every expected index. The path's own
+            // target id still can — one entry per (adapter, target).
+            if (found.Count > expected &&
+                DateTime.UtcNow - started >= TimeSpan.FromSeconds(2) &&
+                TryDedupByTarget(found, expected, out List<MonitorInfo> byTarget))
+            {
+                log.Report($"新建的虚拟显示器多于预期（{found.Count} 台），EDID 序列号重复无法区分，已按显示路径目标去重。");
+                return byTarget;
             }
 
             ct.WaitHandle.WaitOne(PollInterval);
@@ -1282,12 +1300,64 @@ public static class ApplyService
         return true;
     }
 
+    /// <summary>
+    /// Picks one entry per display-config target (adapter LUID + target id) out
+    /// of a list that has more entries than expected. Fallback when the EDID
+    /// serials alias: after a disconnect + revert, re-arrived monitors can all
+    /// resolve to the same EDID, so the serial cannot tell the monitors apart
+    /// — but the path's own target id still can (each live monitor has its own
+    /// target; the extra entries are the same target listed on another source).
+    /// Returns false unless the entries cover exactly the expected number of
+    /// distinct targets. Among duplicates of one target, prefer an active path,
+    /// then a path whose mode list is readable (a live source reports modes; a
+    /// stale source reports none), then the highest DISPLAY number.
+    /// </summary>
+    private static bool TryDedupByTarget(
+        IReadOnlyList<MonitorInfo> found, int expected, out List<MonitorInfo> deduped)
+    {
+        var byTarget = new Dictionary<(uint Low, int High, uint Target), MonitorInfo>();
+        foreach (MonitorInfo m in found)
+        {
+            var key = (m.AdapterIdLow, m.AdapterIdHigh, m.TargetId);
+            if (!byTarget.TryGetValue(key, out MonitorInfo? current) || PreferOver(m, current))
+            {
+                byTarget[key] = m;
+            }
+        }
+
+        if (byTarget.Count != expected)
+        {
+            deduped = new List<MonitorInfo>();
+            return false;
+        }
+
+        deduped = byTarget.Values
+            .OrderBy(m => DisplayConfig.DeviceIndex(m.DeviceName))
+            .ThenBy(m => m.DeviceName, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        return true;
+
+        // Prefer an active path; then a path whose mode list is readable (a
+        // live source reports modes, a stale source reports none); then the
+        // highest DISPLAY number (the newest arrival).
+        static bool PreferOver(MonitorInfo candidate, MonitorInfo current)
+        {
+            if (candidate.IsActivePath != current.IsActivePath) return candidate.IsActivePath;
+            bool candidateModes = candidate.MaxWidth > 0 && candidate.MaxHeight > 0;
+            bool currentModes = current.MaxWidth > 0 && current.MaxHeight > 0;
+            if (candidateModes != currentModes) return candidateModes;
+            return DisplayConfig.DeviceIndex(candidate.DeviceName) > DisplayConfig.DeviceIndex(current.DeviceName);
+        }
+    }
+
     /// <summary>One line per monitor for the timeout message.</summary>
     private static string DescribeMonitors(IReadOnlyList<MonitorInfo> monitors)
         => monitors.Count == 0
             ? "无"
             : string.Join("；", monitors.Select(m =>
-                $"{m.DeviceName}（索引{(m.DeskSplitMonitorIndex < 0 ? "无EDID" : m.DeskSplitMonitorIndex.ToString())}，{(m.IsActivePath ? "已激活" : "未激活")}）"));
+                $"{m.DeviceName}（索引{(m.DeskSplitMonitorIndex < 0 ? "无EDID" : m.DeskSplitMonitorIndex.ToString())}" +
+                (m.Edid is null ? string.Empty : $"，{m.Edid}") +
+                $"，{(m.IsActivePath ? "已激活" : "未激活")}）"));
 
     /// <summary>
     /// Driver-side state for the timeout message. The driver is the only one
