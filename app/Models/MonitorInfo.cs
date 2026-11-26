@@ -52,6 +52,39 @@ public sealed class MonitorInfo
     /// <summary>Numeric suffix of the GDI device name (the n in <c>\\.\DISPLAYn</c>).</summary>
     public int Index { get; init; }
 
+    /// <summary>
+    /// Copy with a different maximum refresh rate (self-test only: forces the
+    /// driver to be configured at exactly 60000 mHz on a 64 Hz runner, to
+    /// prove the 60 Hz mode itself is fine).
+    /// </summary>
+    public MonitorInfo WithMaxRefresh(uint millihertz, int hertz) => new()
+    {
+        DeviceName = DeviceName,
+        FriendlyName = FriendlyName,
+        AdapterPath = AdapterPath,
+        MonitorDevicePath = MonitorDevicePath,
+        EdidManufacturer = EdidManufacturer,
+        CurrentWidth = CurrentWidth,
+        CurrentHeight = CurrentHeight,
+        PositionX = PositionX,
+        PositionY = PositionY,
+        MaxWidth = MaxWidth,
+        MaxHeight = MaxHeight,
+        MaxRefreshHz = hertz,
+        MaxRefreshMillihertz = millihertz,
+        CurrentRefreshHz = CurrentRefreshHz,
+        CurrentRefreshMillihertz = CurrentRefreshMillihertz,
+        Index = Index,
+        AdapterIdLow = AdapterIdLow,
+        AdapterIdHigh = AdapterIdHigh,
+        TargetId = TargetId,
+        IsPrimary = IsPrimary,
+        IsActivePath = IsActivePath,
+        IsDeskSplitVirtual = IsDeskSplitVirtual,
+        Edid = Edid,
+        DeskSplitMonitorIndex = DeskSplitMonitorIndex,
+    };
+
     /// <summary>Low part of the DisplayConfig adapter LUID for this target.</summary>
     public uint AdapterIdLow { get; init; }
 

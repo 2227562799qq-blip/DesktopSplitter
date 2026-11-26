@@ -254,7 +254,7 @@ if (-not $failAt) {
         Write-Host "APPLY-TEST: app exit code = $($applyProcT.ExitCode)"
         if ($applyProcT.ExitCode -eq 2) { Write-Host 'APPLY-TEST: SKIPPED - physical display too small for a 2-way split' }
         elseif ($applyProcT.ExitCode -ne 0) { throw "headless apply self-test failed (exit $($applyProcT.ExitCode))" }
-        Write-Host 'APPLY-TEST: PASSED - real apply (arrange + inactive-repro + rotation + revert) works'
+        Write-Host 'APPLY-TEST: PASSED - real apply (arrange + rotation + sdc-fallback + revert) works; inactive-repro reported separately (not gated)'
     } catch {
         Write-Host "SELF-TEST FAILED: $($_.Exception.Message)"
         $failAt = 'self-test'

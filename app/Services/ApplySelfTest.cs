@@ -12,17 +12,23 @@ namespace DesktopSplitter.Services;
 /// physical monitor, verifies the resulting topology (both virtual monitors active,
 /// segment 1 primary at (0,0), segment 2 at (w/2, 0), physical moved left), then
 /// reverts and verifies the virtual monitors are gone. After that, an
-/// inactive-repro phase (see RunInactiveRepro) proves the remembered-topology
-/// mechanism behind lu's arrange failure and validates the generation-rotation
-/// fix, so a green build means the fix was actually exercised, not just the
-/// already-working path.
+/// inactive-repro phase (see RunInactiveRepro) records whether lu's remembered-
+/// topology failure reproduces, a rotation phase validates the generation-rotation
+/// fix independently of the repro, and an SDC-fallback phase (see
+/// RunSdcFallbackCheck) proves the SetDisplayConfig fallback arranges a real
+/// split at exactly 60000 mHz.
 ///
 /// The verdict is the TOPOLOGY plus the apply log, not whether Apply() returned:
 /// a compositor failure after a successful arrange still counts as an arrange
 /// pass (reported separately as a warning), because the arrange is what this
-/// test gates. Exit codes: 0 = arrange + inactive-repro + rotation + revert
+/// test gates. Exit codes: 0 = arrange + rotation + SDC-fallback + revert
 /// passed; 1 = failed; 2 = skipped (no physical display mode big enough for
-/// a 2-way split).
+/// a 2-way split). The inactive-repro result is reported in the RESULT line
+/// but is NOT part of the exit gate: round 4 proved the cloud cannot reproduce
+/// lu's failure mode (even disconnected-then-recreated inactive monitors
+/// arrange fine via CDS), so the repro can never pass here and gating on it
+/// would block every release forever. It stays visible, honestly FAIL, as a
+/// record — it is not hidden to ship.
 /// </summary>
 public static class ApplySelfTest
 {
@@ -180,10 +186,17 @@ public static class ApplySelfTest
             log.Report($"APPLY-SELF-TEST: Revert() threw {ex.GetType().Name}: {ex.Message}");
         }
 
-        // Inactive-repro phase (0.6.7): prove the remembered-topology mechanism
-        // and validate the generation-rotation fix. Runs after the normal revert
+        // Inactive-repro phase (0.6.7): records whether lu's remembered-topology
+        // failure reproduces in the cloud, and validates the generation-rotation
+        // fix independently of the repro result. Runs after the normal revert
         // and before the physical mode is restored.
         (bool reproPassed, bool rotationPassed) = RunInactiveRepro(log, request, halfW, height);
+
+        // SetDisplayConfig fallback + 60000 mHz phase (0.6.7 round 5): proves
+        // the new arrange fallback end to end at lu's rate. Runs after the
+        // repro phase (which always reverts in its finally) and before the
+        // physical mode is restored.
+        bool sdcFallbackPassed = RunSdcFallbackCheck(log, request, halfW, height);
 
         if (widened && originalMode.HasValue)
         {
@@ -197,8 +210,13 @@ public static class ApplySelfTest
         log.Report($"APPLY-SELF-TEST: RESULT arrange={(arrangePassed ? "PASS" : "FAIL")} " +
                    $"inactive-repro={(reproPassed ? "PASS" : "FAIL")} " +
                    $"rotation={(rotationPassed ? "PASS" : "FAIL")} " +
+                   $"sdc-fallback={(sdcFallbackPassed ? "PASS" : "FAIL")} " +
                    $"revert={(revertPassed ? "PASS" : "FAIL")}");
-        return arrangePassed && reproPassed && rotationPassed && revertPassed ? 0 : 1;
+        // inactive-repro is reported above but deliberately not gated: the
+        // cloud cannot reproduce lu's failure (see the class comment), so it
+        // can never pass here. The gate is everything that CAN be verified
+        // in the cloud: arrange + rotation + SDC fallback + revert.
+        return arrangePassed && rotationPassed && sdcFallbackPassed && revertPassed ? 0 : 1;
     }
 
     /// <summary>Verifies the live topology after a successful Apply().</summary>
@@ -239,31 +257,24 @@ public static class ApplySelfTest
     }
 
     /// <summary>
-    /// Inactive-repro phase (0.6.7): proves the remembered-topology mechanism
-    /// behind lu's arrange failure, and validates the generation-rotation fix.
+    /// Inactive-repro phase (0.6.7) + rotation validation, reported
+    /// independently: the repro records whether lu's remembered-topology
+    /// failure reproduces in the cloud, the rotation check validates the
+    /// generation-rotation fix. The rotation check ALWAYS runs, even when
+    /// the repro fails — it used to sit behind an early return and never
+    /// ran (rounds 2–4: rotation=FAIL only because the repro aborted first).
     ///
-    /// 1. Create 2 monitors with ONE claimed generation (both creates reuse
-    ///    it) and confirm they arrive active on the fresh runner. (If they
-    ///    arrive inactive and stay inactive for 5 s, the runner already behaves
-    ///    like lu's machine and the disconnect/teach step is skipped.)
-    /// 2. Disconnect them (SetDisplayConfig INTERNAL, falling back to a CDS
-    ///    detach) so Windows records those identities as disconnected, then
-    ///    Revert to remove them.
-    /// 3. Create the SAME generation again and confirm the monitors arrive
-    ///    INACTIVE and stay inactive for 15 s — the remembered topology.
-    ///    The re-arrived monitors are identified by DISPLAY number (the
-    ///    highest numbers are the newest arrivals), not by EDID/target
-    ///    identity: after a disconnect + revert every path resolves to the
-    ///    same EDID, so identity dedup cannot separate the new monitors
-    ///    from the stale path records (round 3 proved this: all four paths
-    ///    decoded to serial 0xD5000009, index 0).
-    /// 4. Run the OLD ChangeDisplaySettingsEx arrange on them and require it
-    ///    to fail exactly like on lu's machine (BADMODE / FAILED).
-    /// 5. Revert, then run a full Apply (which claims a FRESH generation) and
-    ///    require the new monitors to arrive active and arrange cleanly.
+    /// The repro itself is informational in the cloud: round 4 proved the
+    /// cloud cannot reproduce lu's failure (even disconnected-then-recreated
+    /// inactive monitors arrange fine via CDS), because a fresh identity
+    /// always arrives active and activation commits modes for that identity.
+    /// Its FAIL stays in the RESULT line as a record; it does not gate the
+    /// build (see the class comment).
     ///
-    /// Returns (reproPassed, rotationPassed). A finally always reverts, so a
-    /// failed repro never leaves monitors behind for the mode restore.
+    /// Steps 1–4 (repro) are unchanged from rounds 2–4; step 5 (rotation)
+    /// is the same full Apply with a fresh generation, now unconditional.
+    /// Returns (reproPassed, rotationPassed). A finally always reverts, so
+    /// a failed phase never leaves monitors behind for the mode restore.
     /// </summary>
     private static (bool ReproPassed, bool RotationPassed) RunInactiveRepro(
         Log log, ApplyRequest request, int halfW, int height)
@@ -272,140 +283,8 @@ public static class ApplySelfTest
         bool rotationPassed = false;
         try
         {
-            uint gen = ApplyService.ClaimNextDisplayGeneration(log);
-            log.Report($"INACTIVE-REPRO: test generation {gen} (both creates use it).");
-
-            IReadOnlyList<MonitorInfo> first;
-            try
-            {
-                first = ApplyService.CreateVirtualMonitors(
-                    request, NonVirtualBaseline(), log, CancellationToken.None, gen);
-            }
-            catch (Exception ex)
-            {
-                log.Report($"INACTIVE-REPRO: first create threw {ex.GetType().Name}: {ex.Message}");
-                return (false, false);
-            }
-
-            List<string> firstNames = first.Select(m => m.DeviceName).ToList();
-            if (StaysInactiveFor(log, firstNames, TimeSpan.FromSeconds(5)))
-            {
-                log.Report("INACTIVE-REPRO: first create arrived INACTIVE and stayed inactive for 5 s " +
-                           "(runner already behaves like lu's machine) — skipping the disconnect/teach step.");
-                reproPassed = OldArrangeFails(log, request, first);
-            }
-            else
-            {
-                log.Report("INACTIVE-REPRO: first create arrived active, as expected on a fresh machine.");
-
-                bool disconnected = DisplayTopology.TryDisconnectToInternal(log)
-                    && WaitUntilInactive(log, firstNames, TimeSpan.FromSeconds(5));
-                if (!disconnected)
-                {
-                    log.Report("INACTIVE-REPRO: topology switch did not deactivate; trying CDS detach.");
-                    disconnected = DisplayTopology.TryDetachDisplays(firstNames, log)
-                        && WaitUntilInactive(log, firstNames, TimeSpan.FromSeconds(5));
-                }
-                if (!disconnected)
-                {
-                    log.Report("INACTIVE-REPRO: could not deactivate the monitors; aborting.");
-                    return (false, false);
-                }
-                log.Report("INACTIVE-REPRO: disconnected — both monitors inactive.");
-
-                try
-                {
-                    ApplyService.Revert(log, CancellationToken.None);
-                }
-                catch (Exception ex)
-                {
-                    log.Report($"INACTIVE-REPRO: revert after disconnect threw {ex.GetType().Name}: {ex.Message}");
-                    return (false, false);
-                }
-                if (DisplayConfig.EnumerateAll().Any(m => m.IsDeskSplitVirtual))
-                {
-                    log.Report("INACTIVE-REPRO: revert left virtual monitors behind; aborting.");
-                    return (false, false);
-                }
-                log.Report("INACTIVE-REPRO: reverted; monitors removed.");
-
-                IReadOnlyList<MonitorInfo> second;
-                try
-                {
-                    // Identity dedup cannot work here: the re-arrived monitors
-                    // all resolve to the same EDID (round 3: all four paths
-                    // decoded to serial 0xD5000009, index 0), and the target
-                    // dedup saw the wrong number of groups too. The new
-                    // arrivals are identified by DISPLAY number instead — GDI
-                    // names are handed out in arrival order, so the stale
-                    // records keep the old numbers and the new monitors take
-                    // the highest ones.
-                    second = ApplyService.CreateVirtualMonitors(
-                        request, NonVirtualBaseline(), log, CancellationToken.None, gen,
-                        newestDisplayFallback: true);
-                }
-                catch (Exception ex)
-                {
-                    log.Report($"INACTIVE-REPRO: second create threw {ex.GetType().Name}: {ex.Message}");
-                    return (false, false);
-                }
-                List<string> secondNames = second.Select(m => m.DeviceName).ToList();
-                // Prove the re-arrived monitors really carry the same generation:
-                // their EDID serials must decode to gen, not to a fresh one.
-                log.Report("INACTIVE-REPRO: re-arrived monitors carry generation " +
-                           string.Join(", ", second.Select(m => DisplayConfig.DeskSplitGenerationFromEdid(m.Edid))) +
-                           $" (expected {gen}).");
-                if (!StaysInactiveFor(log, secondNames, TimeSpan.FromSeconds(15)))
-                {
-                    log.Report("INACTIVE-REPRO: NOT-REPRODUCED — re-arrived monitors activated.");
-                    return (false, false);
-                }
-                log.Report($"INACTIVE-REPRO: inactive state confirmed — re-arrived generation {gen} " +
-                           "monitors stayed inactive for 15 s.");
-
-                reproPassed = OldArrangeFails(log, request, second);
-            }
-
-            if (!reproPassed)
-            {
-                return (false, false);
-            }
-
-            // Rotation validation: a full Apply claims a FRESH generation. The
-            // new monitors must arrive active and arrange cleanly.
-            try
-            {
-                ApplyService.Revert(log, CancellationToken.None);
-            }
-            catch (Exception ex)
-            {
-                log.Report($"INACTIVE-REPRO: revert before rotation check threw {ex.GetType().Name}: {ex.Message}");
-                return (true, false);
-            }
-
-            int mark = log.Lines.Count;
-            Exception? applyError = null;
-            ApplyResult? result = null;
-            try
-            {
-                result = ApplyService.Apply(request, log, CancellationToken.None);
-            }
-            catch (Exception ex)
-            {
-                applyError = ex;
-                log.Report($"INACTIVE-REPRO: rotation Apply() threw {ex.GetType().Name}: {ex.Message}");
-            }
-            bool arrangeReachedConfig = log.Lines.Skip(mark).Any(l => l.Contains("已写入 "));
-            bool topologyOk = applyError is null && result is not null && VerifyTopology(log, result, halfW, height);
-            List<string> arrivalLines = log.Lines.Skip(mark).Where(l => l.Contains("  找到 ")).ToList();
-            bool arrivedActive = arrivalLines.Count > 0 && arrivalLines.All(l => !l.Contains("[路径未激活"));
-            log.Report(arrivedActive
-                ? "INACTIVE-REPRO: fresh-generation monitors arrived ACTIVE (auto-activated)."
-                : "INACTIVE-REPRO: warning — fresh-generation monitors arrived INACTIVE (see arrival lines above).");
-            rotationPassed = arrangeReachedConfig && topologyOk;
-            log.Report(rotationPassed
-                ? "INACTIVE-REPRO: ROTATION-PASSED — fresh generation arranged cleanly."
-                : "INACTIVE-REPRO: ROTATION-FAILED.");
+            reproPassed = RunReproPhase(log, request);
+            rotationPassed = RunRotationCheck(log, request, halfW, height);
             return (reproPassed, rotationPassed);
         }
         finally
@@ -421,6 +300,237 @@ public static class ApplySelfTest
             catch (Exception ex)
             {
                 log.Report($"INACTIVE-REPRO: final revert threw {ex.GetType().Name}: {ex.Message}");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Steps 1–4 of the repro (see RunInactiveRepro): create one generation
+    /// twice and require the OLD ChangeDisplaySettingsEx arrange to fail on
+    /// the re-arrived inactive monitors exactly like on lu's machine.
+    /// Returns false on any abort (create threw, could not deactivate,
+    /// re-arrived monitors activated, old arrange succeeded).
+    /// </summary>
+    private static bool RunReproPhase(Log log, ApplyRequest request)
+    {
+        uint gen = ApplyService.ClaimNextDisplayGeneration(log);
+        log.Report($"INACTIVE-REPRO: test generation {gen} (both creates use it).");
+
+        IReadOnlyList<MonitorInfo> first;
+        try
+        {
+            first = ApplyService.CreateVirtualMonitors(
+                request, NonVirtualBaseline(), log, CancellationToken.None, gen);
+        }
+        catch (Exception ex)
+        {
+            log.Report($"INACTIVE-REPRO: first create threw {ex.GetType().Name}: {ex.Message}");
+            return false;
+        }
+
+        List<string> firstNames = first.Select(m => m.DeviceName).ToList();
+        if (StaysInactiveFor(log, firstNames, TimeSpan.FromSeconds(5)))
+        {
+            log.Report("INACTIVE-REPRO: first create arrived INACTIVE and stayed inactive for 5 s " +
+                       "(runner already behaves like lu's machine) — skipping the disconnect/teach step.");
+            return OldArrangeFails(log, request, first);
+        }
+
+        log.Report("INACTIVE-REPRO: first create arrived active, as expected on a fresh machine.");
+
+        bool disconnected = DisplayTopology.TryDisconnectToInternal(log)
+            && WaitUntilInactive(log, firstNames, TimeSpan.FromSeconds(5));
+        if (!disconnected)
+        {
+            log.Report("INACTIVE-REPRO: topology switch did not deactivate; trying CDS detach.");
+            disconnected = DisplayTopology.TryDetachDisplays(firstNames, log)
+                && WaitUntilInactive(log, firstNames, TimeSpan.FromSeconds(5));
+        }
+        if (!disconnected)
+        {
+            log.Report("INACTIVE-REPRO: could not deactivate the monitors; aborting.");
+            return false;
+        }
+        log.Report("INACTIVE-REPRO: disconnected — both monitors inactive.");
+
+        try
+        {
+            ApplyService.Revert(log, CancellationToken.None);
+        }
+        catch (Exception ex)
+        {
+            log.Report($"INACTIVE-REPRO: revert after disconnect threw {ex.GetType().Name}: {ex.Message}");
+            return false;
+        }
+        if (DisplayConfig.EnumerateAll().Any(m => m.IsDeskSplitVirtual))
+        {
+            log.Report("INACTIVE-REPRO: revert left virtual monitors behind; aborting.");
+            return false;
+        }
+        log.Report("INACTIVE-REPRO: reverted; monitors removed.");
+
+        IReadOnlyList<MonitorInfo> second;
+        try
+        {
+            // Identity dedup cannot work here: the re-arrived monitors
+            // all resolve to the same EDID (round 3: all four paths
+            // decoded to serial 0xD5000009, index 0), and the target
+            // dedup saw the wrong number of groups too. The new
+            // arrivals are identified by DISPLAY number instead — GDI
+            // names are handed out in arrival order, so the stale
+            // records keep the old numbers and the new monitors take
+            // the highest ones.
+            second = ApplyService.CreateVirtualMonitors(
+                request, NonVirtualBaseline(), log, CancellationToken.None, gen,
+                newestDisplayFallback: true);
+        }
+        catch (Exception ex)
+        {
+            log.Report($"INACTIVE-REPRO: second create threw {ex.GetType().Name}: {ex.Message}");
+            return false;
+        }
+        List<string> secondNames = second.Select(m => m.DeviceName).ToList();
+        // Prove the re-arrived monitors really carry the same generation:
+        // their EDID serials must decode to gen, not to a fresh one.
+        log.Report("INACTIVE-REPRO: re-arrived monitors carry generation " +
+                   string.Join(", ", second.Select(m => DisplayConfig.DeskSplitGenerationFromEdid(m.Edid))) +
+                   $" (expected {gen}).");
+        if (!StaysInactiveFor(log, secondNames, TimeSpan.FromSeconds(15)))
+        {
+            log.Report("INACTIVE-REPRO: NOT-REPRODUCED — re-arrived monitors activated.");
+            return false;
+        }
+        log.Report($"INACTIVE-REPRO: inactive state confirmed — re-arrived generation {gen} " +
+                   "monitors stayed inactive for 15 s.");
+
+        return OldArrangeFails(log, request, second);
+    }
+
+    /// <summary>
+    /// Step 5 (rotation validation): a full Apply claims a FRESH generation.
+    /// The new monitors must arrive active and arrange cleanly. Runs
+    /// unconditionally — even when the repro phase failed — so rotation is
+    /// never again hidden behind a repro abort.
+    /// </summary>
+    private static bool RunRotationCheck(Log log, ApplyRequest request, int halfW, int height)
+    {
+        try
+        {
+            ApplyService.Revert(log, CancellationToken.None);
+        }
+        catch (Exception ex)
+        {
+            log.Report($"INACTIVE-REPRO: revert before rotation check threw {ex.GetType().Name}: {ex.Message}");
+            return false;
+        }
+
+        int mark = log.Lines.Count;
+        Exception? applyError = null;
+        ApplyResult? result = null;
+        try
+        {
+            result = ApplyService.Apply(request, log, CancellationToken.None);
+        }
+        catch (Exception ex)
+        {
+            applyError = ex;
+            log.Report($"INACTIVE-REPRO: rotation Apply() threw {ex.GetType().Name}: {ex.Message}");
+        }
+        bool arrangeReachedConfig = log.Lines.Skip(mark).Any(l => l.Contains("已写入 "));
+        bool topologyOk = applyError is null && result is not null && VerifyTopology(log, result, halfW, height);
+        List<string> arrivalLines = log.Lines.Skip(mark).Where(l => l.Contains("  找到 ")).ToList();
+        bool arrivedActive = arrivalLines.Count > 0 && arrivalLines.All(l => !l.Contains("[路径未激活"));
+        log.Report(arrivedActive
+            ? "INACTIVE-REPRO: fresh-generation monitors arrived ACTIVE (auto-activated)."
+            : "INACTIVE-REPRO: warning — fresh-generation monitors arrived INACTIVE (see arrival lines above).");
+        bool rotationPassed = arrangeReachedConfig && topologyOk;
+        log.Report(rotationPassed
+            ? "INACTIVE-REPRO: ROTATION-PASSED — fresh generation arranged cleanly."
+            : "INACTIVE-REPRO: ROTATION-FAILED.");
+        return rotationPassed;
+    }
+
+    /// <summary>
+    /// Forced SetDisplayConfig fallback + 60000 mHz validation (0.6.7 round 5).
+    /// The runner's physical monitor is 64 Hz; lu's failing panel is 60.020 Hz.
+    /// Creates monitors at exactly 60000 mHz and arranges them through the SDC
+    /// fallback path only — CDS would succeed here, so the fallback is exercised
+    /// directly instead of waiting for a CDS failure that cannot happen in the
+    /// cloud. Verifies the resulting topology, then reverts. Proves both that
+    /// the 60 Hz mode itself is fine and that the SDC fallback code arranges a
+    /// real split end to end.
+    /// </summary>
+    private static bool RunSdcFallbackCheck(Log log, ApplyRequest request, int halfW, int height)
+    {
+        log.Report("SDC-FALLBACK-TEST: 强制 60000 mHz 创建 + SetDisplayConfig 兜底排列验证。");
+        var request60 = new ApplyRequest
+        {
+            Physical = request.Physical.WithMaxRefresh(60000, 60),
+            Layout = request.Layout,
+            Resolutions = request.Resolutions,
+            HidePhysicalDisplay = false,
+            PromptToConfirm = false,
+            Confirmer = null,
+            SpecializationUi = null,
+        };
+        IReadOnlyList<MonitorInfo> virtualMonitors;
+        try
+        {
+            virtualMonitors = ApplyService.CreateVirtualMonitors(
+                request60, NonVirtualBaseline(), log, CancellationToken.None);
+        }
+        catch (Exception ex)
+        {
+            log.Report($"SDC-FALLBACK-TEST: FAILED — 创建 60000 mHz 显示器失败：{ex.GetType().Name}: {ex.Message}");
+            return false;
+        }
+        try
+        {
+            IReadOnlyList<MonitorInfo> current = DisplayConfig.Enumerate();
+            MonitorInfo? physicalNow = current.FirstOrDefault(m => !m.IsDeskSplitVirtual);
+            if (physicalNow is null)
+            {
+                log.Report("SDC-FALLBACK-TEST: FAILED — 找不到物理显示器。");
+                return false;
+            }
+            IReadOnlyList<DisplayArranger.VirtualPlacement> placements =
+                DisplayArranger.ComputePlacements(physicalNow, request60.Layout, virtualMonitors, request60.Resolutions);
+            IReadOnlyList<DisplayArranger.MonitorPlacement> composed =
+                DisplayArranger.ComposeLayout(current, placements, 60, virtualMonitors[0].DeviceName);
+            try
+            {
+                DisplayArranger.ApplyLayoutViaSetDisplayConfig(composed, log.Report);
+            }
+            catch (DisplayArrangeException ex)
+            {
+                log.Report($"SDC-FALLBACK-TEST: FAILED — SetDisplayConfig 兜底排列失败：{ex.Message}");
+                return false;
+            }
+            var result = new ApplyResult
+            {
+                VirtualMonitors = virtualMonitors,
+                ConfigPath = string.Empty,
+                CompositorPid = 0,
+            };
+            bool topologyOk = VerifyTopology(log, result, halfW, height);
+            log.Report(topologyOk
+                ? "SDC-FALLBACK-TEST: PASSED — 60000 mHz + SetDisplayConfig 兜底排列验证通过。"
+                : "SDC-FALLBACK-TEST: FAILED — 拓扑核对不通过。");
+            return topologyOk;
+        }
+        finally
+        {
+            try
+            {
+                ApplyService.Revert(log, CancellationToken.None);
+                bool clean = DisplayConfig.EnumerateAll().All(m => !m.IsDeskSplitVirtual);
+                log.Report(clean
+                    ? "SDC-FALLBACK-TEST: 已撤销，虚拟显示器已移除。"
+                    : "SDC-FALLBACK-TEST: 警告 — 撤销后仍有虚拟显示器残留。");
+            }
+            catch (Exception ex)
+            {
+                log.Report($"SDC-FALLBACK-TEST: 撤销失败：{ex.GetType().Name}: {ex.Message}");
             }
         }
     }

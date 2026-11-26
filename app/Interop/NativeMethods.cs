@@ -78,6 +78,8 @@ internal static class NativeMethods
 
     internal const uint DISPLAYCONFIG_PATH_ACTIVE = 0x00000001;
 
+    internal const uint DISPLAYCONFIG_SCANLINE_ORDERING_PROGRESSIVE = 1;
+
     [StructLayout(LayoutKind.Sequential)]
     internal struct POINTL
     {

@@ -207,6 +207,51 @@ public static class DisplayConfig
     private static (DISPLAYCONFIG_PATH_INFO[] Paths, DISPLAYCONFIG_MODE_INFO[] Modes) QueryAllConfig()
         => QueryConfig(QDC_ALL_PATHS);
 
+    /// <summary>
+    /// Raw QDC_ALL_PATHS entry for one GDI device, for the SetDisplayConfig
+    /// fallback in <see cref="DisplayArranger"/>: it needs the adapter LUID +
+    /// source/target ids of every monitor in the layout, including inactive
+    /// ones, plus the source/target modes Windows is currently using for that
+    /// path (reused verbatim for monitors whose mode must not change, and for
+    /// active paths the fallback carries over untouched).
+    /// </summary>
+    internal sealed record PathIdentity(
+        string DeviceName,
+        DISPLAYCONFIG_PATH_INFO Path,
+        DISPLAYCONFIG_MODE_INFO? CurrentSourceMode,
+        DISPLAYCONFIG_MODE_INFO? CurrentTargetMode);
+
+    /// <summary>
+    /// Every path Windows knows about, keyed by GDI device name. When one name
+    /// appears on several paths (stale records left by a disconnected monitor),
+    /// the active path wins; otherwise the first one seen.
+    /// </summary>
+    internal static IReadOnlyList<PathIdentity> QueryPathIdentities()
+    {
+        (DISPLAYCONFIG_PATH_INFO[] paths, DISPLAYCONFIG_MODE_INFO[] modes) = QueryAllConfig();
+        var byDevice = new Dictionary<string, PathIdentity>(StringComparer.OrdinalIgnoreCase);
+        foreach (DISPLAYCONFIG_PATH_INFO path in paths)
+        {
+            string gdiName = GetSourceGdiName(path);
+            if (string.IsNullOrEmpty(gdiName)) continue;
+            bool isActive = (path.flags & DISPLAYCONFIG_PATH_ACTIVE) != 0;
+            if (byDevice.TryGetValue(gdiName, out PathIdentity? existing) && !isActive)
+                continue;
+
+            DISPLAYCONFIG_MODE_INFO? sourceMode = null;
+            DISPLAYCONFIG_MODE_INFO? targetMode = null;
+            uint srcIdx = path.sourceInfo.modeInfoIdx;
+            if (srcIdx < modes.Length && modes[srcIdx].infoType == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE)
+                sourceMode = modes[srcIdx];
+            uint tgtIdx = path.targetInfo.modeInfoIdx;
+            if (tgtIdx < modes.Length && modes[tgtIdx].infoType == DISPLAYCONFIG_MODE_INFO_TYPE_TARGET)
+                targetMode = modes[tgtIdx];
+
+            byDevice[gdiName] = new PathIdentity(gdiName, path, sourceMode, targetMode);
+        }
+        return byDevice.Values.ToList();
+    }
+
     private static (DISPLAYCONFIG_PATH_INFO[] Paths, DISPLAYCONFIG_MODE_INFO[] Modes) QueryConfig(uint flags)
     {
         // The topology can change between the sizing call and the query call; retry.
