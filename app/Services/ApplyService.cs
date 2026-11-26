@@ -138,7 +138,34 @@ public static class ApplyService
         ApplyResult applied;
         lock (DisplayOperationGate)
         {
-            applied = ApplyCore(request, log, ct, out snapshot);
+            try
+            {
+                applied = ApplyCore(request, log, ct, out snapshot);
+            }
+            catch
+            {
+                // A failure after the virtual monitors were created must not leave
+                // them live: the next attempt's wait counts only NEW monitors, so
+                // leftovers make every retry time out. Clean up only when the
+                // driver actually has live monitors, so a pre-config failure
+                // (driver missing, bad request) stays quiet.
+                bool needsCleanup = false;
+                try { needsCleanup = DriverClient.GetStatus().ActiveMonitorCount > 0; }
+                catch { /* driver gone: nothing to clean up */ }
+                if (needsCleanup)
+                {
+                    try
+                    {
+                        log.Report("应用失败，正在清理已创建的虚拟显示器……");
+                        RevertCore(log, ct, request.SpecializationUi);
+                    }
+                    catch (Exception ex)
+                    {
+                        log.Report($"清理失败的分屏时出错（已忽略）：{ex.Message}");
+                    }
+                }
+                throw;
+            }
         }
 
         // g. "Keep these display settings?" — only for user-initiated applies. A change that

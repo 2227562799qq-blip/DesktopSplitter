@@ -22,6 +22,16 @@ public partial class App : Application
     {
         base.OnStartup(e);
 
+        // Headless CI self-test: run the real apply flow with no window and exit.
+        // Must run before any window, tray icon or MessageBox handler exists.
+        if (Array.Exists(e.Args, a => string.Equals(a, "--self-test-apply", StringComparison.OrdinalIgnoreCase)))
+        {
+            ShutdownMode = ShutdownMode.OnExplicitShutdown;
+            int exitCode = ApplySelfTest.Run();
+            Shutdown(exitCode);
+            return;
+        }
+
         LaunchedAtStartup = StartupRegistration.LaunchedAtStartup(e.Args);
 
         DispatcherUnhandledException += (_, args) =>

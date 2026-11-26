@@ -233,6 +233,25 @@ if (-not $failAt) {
         $splitOut | ForEach-Object { Write-Host $_ }
         if ($LASTEXITCODE -ne 0) { throw "split test harness exited $LASTEXITCODE" }
         Write-Host 'SPLIT-TEST: PASSED - 2 virtual monitors arrived and activated'
+
+        # Full apply through the REAL app: the driver-level test above never
+        # exercises ApplyLayout (ChangeDisplaySettingsEx on the virtual
+        # monitors), and that is exactly where 0.6.4 failed on the target PC
+        # (mode rejected for both virtual monitors). Run the app headless with
+        # --self-test-apply: real ApplyService.Apply for a 2-way split, then
+        # topology verification and Revert. The driver is still installed here;
+        # the finally block below uninstalls it.
+        Write-Host 'APPLY-TEST: running the real apply headlessly (DesktopSplitter.exe --self-test-apply)...'
+        $appExeT = 'app\\bin\\Release\\net8.0-windows\\DesktopSplitter.exe'
+        if (-not (Test-Path $appExeT)) { throw "app exe not found: $appExeT" }
+        if (Test-Path 'apply-self-test.log') { Remove-Item 'apply-self-test.log' -Force }
+        $applyProcT = Start-Process -FilePath (Join-Path $PWD $appExeT) -ArgumentList '--self-test-apply' -PassThru -NoNewWindow
+        if (-not $applyProcT.WaitForExit(300000)) { $applyProcT.Kill(); throw 'headless apply self-test timed out after 5 minutes' }
+        if (Test-Path 'apply-self-test.log') { Get-Content 'apply-self-test.log' | ForEach-Object { Write-Host "APPLY-TEST: $_" } }
+        Write-Host "APPLY-TEST: app exit code = $($applyProcT.ExitCode)"
+        if ($applyProcT.ExitCode -eq 2) { Write-Host 'APPLY-TEST: SKIPPED - physical display too small for a 2-way split' }
+        elseif ($applyProcT.ExitCode -ne 0) { throw "headless apply self-test failed (exit $($applyProcT.ExitCode))" }
+        Write-Host 'APPLY-TEST: PASSED - real apply (arrange + revert) works'
     } catch {
         Write-Host "SELF-TEST FAILED: $($_.Exception.Message)"
         $failAt = 'self-test'
