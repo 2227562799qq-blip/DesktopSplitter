@@ -231,11 +231,12 @@ public static class ApplyService
 
         // b. Wait for the virtual monitors to arrive.
         log.Report($"等待 {segmentCount} 台虚拟显示器出现（最多 {MonitorArrivalTimeout.TotalSeconds:0} 秒）……");
-        IReadOnlyList<MonitorInfo> arrived = WaitForVirtualMonitors(baseline, segmentCount, ct);
+        IReadOnlyList<MonitorInfo> arrived = WaitForVirtualMonitors(segmentCount, ct);
         foreach (MonitorInfo m in arrived)
         {
             log.Report($"  找到 {m.DeviceName}（{m.FriendlyName}）" +
-                       (m.Edid is null ? "  [无 EDID]" : $"  [{m.Edid}]"));
+                       (m.Edid is null ? "  [无 EDID]" : $"  [{m.Edid}]") +
+                       (m.IsActivePath ? string.Empty : "  [路径未激活，排列时激活]"));
         }
 
         // Map segment i -> the monitor the driver created as DESKSPLIT_CONFIG.Monitors[i],
@@ -1024,8 +1025,19 @@ public static class ApplyService
         return false;
     }
 
+    /// <summary>
+    /// Waits until the driver-created virtual monitors show up in the display
+    /// topology. Counts on arrival (all paths), not on activation: on some
+    /// machines Windows is slow to activate a newly arrived indirect-display
+    /// path, and the old active-paths-only wait then timed out after 15 seconds
+    /// reporting 0 monitors even though the driver had created them. The
+    /// arrange step that follows activates the paths explicitly, so arriving
+    /// is enough to proceed. Only our own monitors are counted: with all
+    /// paths visible, an inactive physical path that is not in the baseline
+    /// would otherwise be miscounted as arrived.
+    /// </summary>
     private static IReadOnlyList<MonitorInfo> WaitForVirtualMonitors(
-        HashSet<string> baseline, int expected, CancellationToken ct)
+        int expected, CancellationToken ct)
     {
         DateTime deadline = DateTime.UtcNow + MonitorArrivalTimeout;
         List<MonitorInfo> found = new();
@@ -1034,8 +1046,8 @@ public static class ApplyService
         {
             ct.ThrowIfCancellationRequested();
 
-            found = SafeEnumerate()
-                .Where(m => m.IsDeskSplitVirtual || !baseline.Contains(m.DeviceName))
+            found = SafeEnumerateAll()
+                .Where(m => m.IsDeskSplitVirtual)
                 .OrderBy(m => DisplayConfig.DeviceIndex(m.DeviceName))
                 .ThenBy(m => m.DeviceName, StringComparer.OrdinalIgnoreCase)
                 .ToList();
@@ -1047,13 +1059,52 @@ public static class ApplyService
 
         throw new ApplyException(
             $"等待虚拟显示器超时（{MonitorArrivalTimeout.TotalSeconds:0} 秒）：" +
-            $"应有 {expected} 台，实际看到 {found.Count} 台。DesktopSplitter 驱动是否已安装并启动" +
-            "（设备管理器 > 显示适配器）？");
+            $"应有 {expected} 台，实际看到 {found.Count} 台。{DriverStatusText()}");
+    }
+
+    /// <summary>
+    /// Driver-side state for the timeout message. The driver is the only one
+    /// that knows whether its adapter initialised and whether its monitors
+    /// actually arrived; its own trace goes to OutputDebugString only, so
+    /// without this the failure is invisible (no event-log entry anywhere).
+    /// Best effort: if the driver cannot be reached at all, say so.
+    /// </summary>
+    private static string DriverStatusText()
+    {
+        try
+        {
+            DESKSPLIT_STATUS status = DriverClient.GetStatus();
+            string ready = status.AdapterReady != 0 ? "已就绪" : "未就绪";
+            string text = $"驱动状态：适配器{ready}，驱动内已有 {status.ActiveMonitorCount} 台虚拟显示器";
+            if (status.LastErrorStage != 0)
+            {
+                string stage = status.LastErrorStage switch
+                {
+                    1 => "适配器初始化",
+                    2 => "显示器创建",
+                    3 => "显示器到达",
+                    4 => "配置排队（适配器未就绪）",
+                    _ => $"未知阶段 {status.LastErrorStage}",
+                };
+                text += $"，最后失败在{stage}（0x{status.LastErrorNtStatus:X8}）";
+            }
+            return text + "。";
+        }
+        catch
+        {
+            return "读不到驱动状态（驱动设备未找到或无法打开）。";
+        }
     }
 
     private static IReadOnlyList<MonitorInfo> SafeEnumerate()
     {
         try { return DisplayConfig.Enumerate(); }
+        catch (DisplayConfigException) { return Array.Empty<MonitorInfo>(); }
+    }
+
+    private static IReadOnlyList<MonitorInfo> SafeEnumerateAll()
+    {
+        try { return DisplayConfig.EnumerateAll(); }
         catch (DisplayConfigException) { return Array.Empty<MonitorInfo>(); }
     }
 

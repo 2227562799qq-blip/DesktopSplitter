@@ -55,10 +55,24 @@ typedef struct DESKSPLIT_CONFIG {
 } DESKSPLIT_CONFIG;
 
 // Output buffer for IOCTL_DESKSPLIT_GET_STATUS.
+// Extended in 0.6.2: the adapter-ready flag and the last failure stage are
+// what the control app reports when an apply times out, so a silent driver
+// failure (which never reaches the Windows event log) is diagnosable from
+// the app log alone. Fields are appended only; the first two are unchanged.
 typedef struct DESKSPLIT_STATUS {
     uint32_t Version;               // driver protocol version
     uint32_t ActiveMonitorCount;    // monitors currently arrived
+    uint32_t AdapterReady;          // 1 = IddCx adapter initialised, 0 = not yet / failed
+    uint32_t LastErrorStage;        // DESKSPLIT_STAGE_* below, 0 = none
+    uint32_t LastErrorNtStatus;     // NTSTATUS of the last failure, 0 = none
 } DESKSPLIT_STATUS;
+
+// DESKSPLIT_STATUS.LastErrorStage values.
+#define DESKSPLIT_STAGE_NONE              0
+#define DESKSPLIT_STAGE_ADAPTER_INIT      1
+#define DESKSPLIT_STAGE_MONITOR_CREATE    2
+#define DESKSPLIT_STAGE_MONITOR_ARRIVAL   3
+#define DESKSPLIT_STAGE_QUEUED_NOT_READY  4
 
 #pragma pack(pop)
 

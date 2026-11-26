@@ -474,6 +474,8 @@ IndirectDeviceContext::IndirectDeviceContext(WDFDEVICE WdfDevice)
     , m_Adapter(nullptr)
     , m_AdapterInitStarted(false)
     , m_AdapterReady(false)
+    , m_LastErrorStage(DESKSPLIT_STAGE_NONE)
+    , m_LastErrorStatus(STATUS_SUCCESS)
     , m_HasPendingConfig(false)
 {
     ZeroMemory(&m_PendingConfig, sizeof(m_PendingConfig));
@@ -486,6 +488,12 @@ IndirectDeviceContext::~IndirectDeviceContext()
     {
         ClearEdidEntry(Index);
     }
+}
+
+void IndirectDeviceContext::RecordLastError(UINT32 Stage, NTSTATUS Status)
+{
+    m_LastErrorStage = Stage;
+    m_LastErrorStatus = Status;
 }
 
 void IndirectDeviceContext::InitAdapter()
@@ -532,6 +540,7 @@ void IndirectDeviceContext::InitAdapter()
     if (!NT_SUCCESS(Status))
     {
         DS_ERROR("IddCxAdapterInitAsync failed: 0x%08X", Status);
+        RecordLastError(DESKSPLIT_STAGE_ADAPTER_INIT, Status);
         return;
     }
 
@@ -553,10 +562,12 @@ void IndirectDeviceContext::OnAdapterInitFinished(IDDCX_ADAPTER AdapterObject, N
     {
         DS_ERROR("Adapter initialisation failed: 0x%08X", InitStatus);
         m_AdapterReady = false;
+        RecordLastError(DESKSPLIT_STAGE_ADAPTER_INIT, InitStatus);
         return;
     }
 
     m_AdapterReady = true;
+    RecordLastError(DESKSPLIT_STAGE_NONE, STATUS_SUCCESS);
 
     DESKSPLIT_CONFIG Config = {};
 
@@ -609,6 +620,7 @@ NTSTATUS IndirectDeviceContext::ApplyConfig(const DESKSPLIT_CONFIG& Config, bool
         m_PendingConfig = Config;
         m_HasPendingConfig = true;
         DS_INFO("Adapter not ready yet; configuration queued");
+        RecordLastError(DESKSPLIT_STAGE_QUEUED_NOT_READY, STATUS_DEVICE_NOT_READY);
         return STATUS_SUCCESS;
     }
 
@@ -653,6 +665,11 @@ NTSTATUS IndirectDeviceContext::ApplyConfig(const DESKSPLIT_CONFIG& Config, bool
         }
     }
 
+    if (NT_SUCCESS(Result))
+    {
+        RecordLastError(DESKSPLIT_STAGE_NONE, STATUS_SUCCESS);
+    }
+
     return Result;
 }
 
@@ -673,6 +690,9 @@ void IndirectDeviceContext::GetStatus(DESKSPLIT_STATUS* pStatus)
     }
 
     pStatus->ActiveMonitorCount = ActiveCount;
+    pStatus->AdapterReady = m_AdapterReady ? 1u : 0u;
+    pStatus->LastErrorStage = m_LastErrorStage;
+    pStatus->LastErrorNtStatus = static_cast<UINT32>(m_LastErrorStatus);
 }
 
 _Use_decl_annotations_
@@ -691,6 +711,7 @@ NTSTATUS IndirectDeviceContext::CreateMonitorLocked(UINT32 MonitorIndex, const D
 
     if (!DeskSplitBuildEdid(MonitorIndex, Config, Slot.Edid))
     {
+        RecordLastError(DESKSPLIT_STAGE_MONITOR_CREATE, STATUS_INVALID_PARAMETER);
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -728,6 +749,7 @@ NTSTATUS IndirectDeviceContext::CreateMonitorLocked(UINT32 MonitorIndex, const D
     if (!NT_SUCCESS(Status))
     {
         ClearEdidEntry(MonitorIndex);
+        RecordLastError(DESKSPLIT_STAGE_MONITOR_CREATE, Status);
         return Status;
     }
 
@@ -747,6 +769,7 @@ NTSTATUS IndirectDeviceContext::CreateMonitorLocked(UINT32 MonitorIndex, const D
     {
         (void)IddCxMonitorDeparture(MonitorCreateOut.MonitorObject);
         ClearEdidEntry(MonitorIndex);
+        RecordLastError(DESKSPLIT_STAGE_MONITOR_ARRIVAL, Status);
         return Status;
     }
 

@@ -221,6 +221,18 @@ if (-not $failAt) {
         if ($devT.PNPClass -ne 'Display') { throw "device class is '$($devT.PNPClass)', expected 'Display' (driver not bound)" }
         if ($devT.ConfigManagerErrorCode -ne 0) { throw "device problem code $($devT.ConfigManagerErrorCode), expected 0" }
         Write-Host 'SELF-TEST: PASSED - driver bound on a machine missing WUDFRD.inf'
+
+        # End-to-end split: the install check above only proves the driver
+        # binds. The 0.6.2 bug was that the split itself produced 0 virtual
+        # monitors (the driver created them, Windows never activated their
+        # paths, the app waited on active paths only). Drive the real driver
+        # with SET_CONFIG and require 2 monitors at all three levels:
+        # driver count, all paths, active paths.
+        Write-Host 'SPLIT-TEST: applying a 2-way split through the real driver...'
+        $splitOut = & dotnet run --project ci\test-split\test-split.csproj -c Release --nologo --disable-build-servers 2>&1
+        $splitOut | ForEach-Object { Write-Host $_ }
+        if ($LASTEXITCODE -ne 0) { throw "split test harness exited $LASTEXITCODE" }
+        Write-Host 'SPLIT-TEST: PASSED - 2 virtual monitors arrived and activated'
     } catch {
         Write-Host "SELF-TEST FAILED: $($_.Exception.Message)"
         $failAt = 'self-test'

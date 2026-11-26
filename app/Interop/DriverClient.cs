@@ -54,6 +54,12 @@ public struct DESKSPLIT_STATUS
 {
     public uint Version;
     public uint ActiveMonitorCount;
+    /// <summary>1 = IddCx adapter initialised, 0 = not yet / failed (0.6.2+).</summary>
+    public uint AdapterReady;
+    /// <summary>Last driver failure stage, 0 = none (0.6.2+).</summary>
+    public uint LastErrorStage;
+    /// <summary>NTSTATUS of the last driver failure, 0 = none (0.6.2+).</summary>
+    public uint LastErrorNtStatus;
 }
 
 /// <summary>

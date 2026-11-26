@@ -52,9 +52,23 @@ public static class DisplayConfig
     /// flagged with <see cref="MonitorInfo.IsDeskSplitVirtual"/> rather than dropped so
     /// the apply/revert flows can find them.
     /// </summary>
-    public static IReadOnlyList<MonitorInfo> Enumerate()
+    public static IReadOnlyList<MonitorInfo> Enumerate() => EnumerateCore(allPaths: false);
+
+    /// <summary>
+    /// Enumerate every monitor Windows knows about, including ones whose display
+    /// path is not active yet. A virtual monitor the driver has just created
+    /// shows up here as soon as it arrives, before Windows activates its path;
+    /// the active-only <see cref="Enumerate"/> cannot see it until then. The
+    /// apply wait uses this so a slow-to-activate indirect display is counted
+    /// as arrived (the arrange step is what activates it), instead of timing
+    /// out after 15 seconds reporting 0 monitors on machines where activation
+    /// stalls. <see cref="MonitorInfo.IsActivePath"/> tells the two apart.
+    /// </summary>
+    public static IReadOnlyList<MonitorInfo> EnumerateAll() => EnumerateCore(allPaths: true);
+
+    private static IReadOnlyList<MonitorInfo> EnumerateCore(bool allPaths)
     {
-        (DISPLAYCONFIG_PATH_INFO[] paths, _) = QueryActiveConfig();
+        (DISPLAYCONFIG_PATH_INFO[] paths, _) = allPaths ? QueryAllConfig() : QueryActiveConfig();
 
         Dictionary<string, uint> deviceFlags = EnumerateDeviceFlags();
 
@@ -66,11 +80,24 @@ public static class DisplayConfig
 
         foreach (DISPLAYCONFIG_PATH_INFO path in paths)
         {
-            if ((path.flags & DISPLAYCONFIG_PATH_ACTIVE) == 0) continue;
+            bool isActive = (path.flags & DISPLAYCONFIG_PATH_ACTIVE) != 0;
+            if (!allPaths && !isActive) continue;
 
             string gdiName = GetSourceGdiName(path);
             if (string.IsNullOrEmpty(gdiName)) continue;
-            if (byDevice.ContainsKey(gdiName)) continue;   // clone group: first target wins
+            if (byDevice.TryGetValue(gdiName, out MonitorInfo? existing))
+            {
+                // Same GDI device on two paths (clone group, or the same target
+                // listed once active and once inactive): prefer the active entry.
+                if (!existing.IsActivePath && isActive)
+                {
+                    ordered.Remove(existing);
+                }
+                else
+                {
+                    continue;
+                }
+            }
 
             TargetNameInfo target = GetTargetName(path);
             string adapterPath = GetAdapterPath(path);
@@ -129,6 +156,7 @@ public static class DisplayConfig
                 CurrentRefreshHz = survey.CurrentRefreshHz,
                 CurrentRefreshMillihertz = currentMillihertz,
                 IsPrimary = (flags & DISPLAY_DEVICE_PRIMARY_DEVICE) != 0,
+                IsActivePath = isActive,
                 IsDeskSplitVirtual = IsOurVirtualMonitor(target, adapterPath, edid),
             };
 
@@ -162,18 +190,24 @@ public static class DisplayConfig
     // ------------------------------------------------------------------ internals
 
     private static (DISPLAYCONFIG_PATH_INFO[] Paths, DISPLAYCONFIG_MODE_INFO[] Modes) QueryActiveConfig()
+        => QueryConfig(QDC_ONLY_ACTIVE_PATHS);
+
+    private static (DISPLAYCONFIG_PATH_INFO[] Paths, DISPLAYCONFIG_MODE_INFO[] Modes) QueryAllConfig()
+        => QueryConfig(QDC_ALL_PATHS);
+
+    private static (DISPLAYCONFIG_PATH_INFO[] Paths, DISPLAYCONFIG_MODE_INFO[] Modes) QueryConfig(uint flags)
     {
         // The topology can change between the sizing call and the query call; retry.
         for (int attempt = 0; attempt < 5; attempt++)
         {
-            int rc = GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, out uint pathCount, out uint modeCount);
+            int rc = GetDisplayConfigBufferSizes(flags, out uint pathCount, out uint modeCount);
             if (rc != ERROR_SUCCESS)
                 throw new DisplayConfigException($"GetDisplayConfigBufferSizes 失败（错误 {rc}）。");
 
             var paths = new DISPLAYCONFIG_PATH_INFO[pathCount];
             var modes = new DISPLAYCONFIG_MODE_INFO[modeCount];
 
-            rc = QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, ref pathCount, paths, ref modeCount, modes, IntPtr.Zero);
+            rc = QueryDisplayConfig(flags, ref pathCount, paths, ref modeCount, modes, IntPtr.Zero);
             if (rc == ERROR_SUCCESS)
             {
                 Array.Resize(ref paths, (int)pathCount);

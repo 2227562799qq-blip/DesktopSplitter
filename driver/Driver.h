@@ -151,6 +151,15 @@ namespace DesktopSplitter
         bool m_AdapterInitStarted;
         bool m_AdapterReady;
 
+        // Last driver-side failure, for IOCTL_DESKSPLIT_GET_STATUS: the
+        // control app reports these when an apply times out, because the
+        // driver's trace (OutputDebugString) is invisible without DebugView
+        // and nothing here ever reaches the Windows event log.
+        UINT32 m_LastErrorStage;
+        NTSTATUS m_LastErrorStatus;
+
+        void RecordLastError(UINT32 Stage, NTSTATUS Status);
+
         bool m_HasPendingConfig;
         DESKSPLIT_CONFIG m_PendingConfig;
 

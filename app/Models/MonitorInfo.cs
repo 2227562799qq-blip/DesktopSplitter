@@ -63,6 +63,16 @@ public sealed class MonitorInfo
 
     public bool IsPrimary { get; init; }
 
+    /// <summary>
+    /// True when this monitor is part of an ACTIVE display path. A virtual
+    /// monitor that has arrived but whose path Windows has not activated yet
+    /// reports false here; it is still a real, addressable monitor, just not
+    /// on the desktop yet. The apply wait counts those too (see
+    /// <see cref="DisplayConfig.EnumerateAll"/>), because on some machines
+    /// the OS is slow to activate new indirect-display paths.
+    /// </summary>
+    public bool IsActivePath { get; init; }
+
     /// <summary>True when this target belongs to the DesktopSplitter virtual driver.</summary>
     public bool IsDeskSplitVirtual { get; init; }
 
