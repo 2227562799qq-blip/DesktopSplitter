@@ -194,6 +194,15 @@ public static class ApplyService
             .Select(m => m.DeviceName)
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
+        // Virtual monitors that already exist before this apply. Stale entries
+        // from earlier attempts stay in the display database with our EDID
+        // cached, and QDC_ALL_PATHS still lists them — the wait must count
+        // only monitors this apply creates, or it sees 4 when it wants 2.
+        var virtualBaseline = DisplayConfig.EnumerateAll()
+            .Where(m => m.IsDeskSplitVirtual)
+            .Select(m => m.DeviceName)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
         // Remember which display was primary BEFORE we touch anything — Revert restores
         // exactly this monitor, which is not necessarily the one being split.
         (string previousPrimaryDevice, string previousPrimaryName) = CapturePreviousPrimary(before, log);
@@ -231,7 +240,7 @@ public static class ApplyService
 
         // b. Wait for the virtual monitors to arrive.
         log.Report($"等待 {segmentCount} 台虚拟显示器出现（最多 {MonitorArrivalTimeout.TotalSeconds:0} 秒）……");
-        IReadOnlyList<MonitorInfo> arrived = WaitForVirtualMonitors(segmentCount, ct);
+        IReadOnlyList<MonitorInfo> arrived = WaitForVirtualMonitors(segmentCount, virtualBaseline, ct);
         foreach (MonitorInfo m in arrived)
         {
             log.Report($"  找到 {m.DeviceName}（{m.FriendlyName}）" +
@@ -1032,25 +1041,32 @@ public static class ApplyService
     /// path, and the old active-paths-only wait then timed out after 15 seconds
     /// reporting 0 monitors even though the driver had created them. The
     /// arrange step that follows activates the paths explicitly, so arriving
-    /// is enough to proceed. Only our own monitors are counted: with all
-    /// paths visible, an inactive physical path that is not in the baseline
-    /// would otherwise be miscounted as arrived.
+    /// is enough to proceed. Only monitors created by THIS apply are counted:
+    /// stale entries from earlier attempts stay in the display database with
+    /// our EDID cached, and QDC_ALL_PATHS still lists them, so without the
+    /// <paramref name="virtualBaseline"/> exclusion the wait sees 4 when it
+    /// wants 2 and times out even though the driver created both monitors.
     /// </summary>
     private static IReadOnlyList<MonitorInfo> WaitForVirtualMonitors(
-        int expected, CancellationToken ct)
+        int expected, HashSet<string> virtualBaseline, CancellationToken ct)
     {
         DateTime deadline = DateTime.UtcNow + MonitorArrivalTimeout;
         List<MonitorInfo> found = new();
+        int preExisting = 0;
 
         while (DateTime.UtcNow < deadline)
         {
             ct.ThrowIfCancellationRequested();
 
-            found = SafeEnumerateAll()
+            List<MonitorInfo> allVirtual = SafeEnumerateAll()
                 .Where(m => m.IsDeskSplitVirtual)
+                .ToList();
+            found = allVirtual
+                .Where(m => !virtualBaseline.Contains(m.DeviceName))
                 .OrderBy(m => DisplayConfig.DeviceIndex(m.DeviceName))
                 .ThenBy(m => m.DeviceName, StringComparer.OrdinalIgnoreCase)
                 .ToList();
+            preExisting = allVirtual.Count - found.Count;
 
             if (found.Count == expected) return found;
 
@@ -1059,7 +1075,9 @@ public static class ApplyService
 
         throw new ApplyException(
             $"等待虚拟显示器超时（{MonitorArrivalTimeout.TotalSeconds:0} 秒）：" +
-            $"应有 {expected} 台，实际看到 {found.Count} 台。{DriverStatusText()}");
+            $"应有 {expected} 台，本次新建看到 {found.Count} 台" +
+            (preExisting > 0 ? $"（另有 {preExisting} 台以前留下的虚拟显示器未计入）" : "") +
+            $"。{DriverStatusText()}");
     }
 
     /// <summary>
