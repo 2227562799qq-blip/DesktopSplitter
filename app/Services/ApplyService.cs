@@ -198,12 +198,13 @@ public static class ApplyService
     }
 
     /// <summary>
-    /// Rounds a refresh rate to whole hertz (in millihertz). The driver reports the
-    /// rate we send it as the virtual monitor's ONLY mode, and a DEVMODE can only ask
-    /// for whole hertz (dmDisplayFrequency is an integer). A fractional physical rate
-    /// (e.g. 60020 mHz on a 60.020 Hz panel) would make that mode un-requestable:
-    /// ChangeDisplaySettingsEx then fails with DISP_CHANGE_BADMODE even on the
-    /// no-refresh retry, because Windows still resolves the request to 60 Hz.
+    /// Rounds a refresh rate to whole hertz (in millihertz). Kept as a tested
+    /// utility: a DEVMODE can only ask for whole hertz (dmDisplayFrequency is an
+    /// integer), so a fractional rate (e.g. 60020 mHz on a 60.020 Hz panel) would
+    /// make that mode un-requestable — ChangeDisplaySettingsEx then fails with
+    /// DISP_CHANGE_BADMODE even on the no-refresh retry, because Windows still
+    /// resolves the request to 60 Hz. Production no longer rounds the physical
+    /// rate: virtual monitors now run at the fixed rate below.
     /// </summary>
     internal static uint RoundRefreshMillihertzToWholeHertz(uint millihertz)
         => (uint)Math.Round(millihertz / 1000.0, MidpointRounding.AwayFromZero) * 1000u;
@@ -270,8 +271,23 @@ public static class ApplyService
     }
 
     /// <summary>
-    /// Pure config construction for one apply: one mode per segment, refresh
-    /// rounded to whole hertz (see RoundRefreshMillihertzToWholeHertz), and the
+    /// Virtual monitors always run at a fixed 60 Hz, whatever the physical panel
+    /// reports. The driver reports this exact rate as each virtual monitor's only
+    /// mode, so it must be a rate the OS accepts on any machine: following the
+    /// physical panel (165 Hz, or a 32 Hz Generic Non-PnP panel) risks the OS
+    /// never creating display paths for the virtual monitors at all — observed
+    /// on the 32 Hz panel, where Arrival succeeded but QDC showed 0 paths in
+    /// 15 s. The compositor still paces frames to the physical panel's real
+    /// refresh (CompositorConfig.RefreshMillihertz); only the virtual mode is fixed.
+    /// </summary>
+    internal const uint VirtualRefreshMillihertz = 60000;
+
+    /// <summary>Whole-hertz form of <see cref="VirtualRefreshMillihertz"/>.</summary>
+    internal const int VirtualRefreshHz = 60;
+
+    /// <summary>
+    /// Pure config construction for one apply: one mode per segment at the fixed
+    /// virtual refresh (see <see cref="VirtualRefreshMillihertz"/>), and the
     /// claimed generation stamped on the whole config.
     /// </summary>
     internal static DESKSPLIT_CONFIG BuildDriverConfig(
@@ -282,12 +298,7 @@ public static class ApplyService
         DESKSPLIT_CONFIG cfg = DriverClient.NewConfig();
         cfg.MonitorCount = (uint)segmentCount;
         cfg.Generation = generation;
-        // The driver reports this exact rate as each virtual monitor's only mode, so
-        // it must be a rate the OS can actually set — see
-        // RoundRefreshMillihertzToWholeHertz. A fractional rate here (e.g. 60020 mHz)
-        // made the arrange step fail with DISP_CHANGE_BADMODE on every attempt.
-        uint driverRefreshMillihertz =
-            RoundRefreshMillihertzToWholeHertz(physical.MaxRefreshMillihertz);
+        uint driverRefreshMillihertz = VirtualRefreshMillihertz;
         for (int i = 0; i < segmentCount; i++)
         {
             (int w, int h) = resolutions[i];
@@ -341,10 +352,7 @@ public static class ApplyService
         uint driverRefreshMillihertz = cfg.Monitors[0].Modes[0].RefreshMillihertz;
         log.Report($"发送 IOCTL_DESKSPLIT_SET_CONFIG（0x{DriverClient.IOCTL_DESKSPLIT_SET_CONFIG:X8}）：" +
                    $"{segmentCount} 台显示器，{driverRefreshMillihertz} mHz" +
-                   (driverRefreshMillihertz == request.Physical.MaxRefreshMillihertz
-                       ? "……"
-                       : $"（物理屏实测 {request.Physical.MaxRefreshMillihertz} mHz，已取整为整赫兹）……") +
-                   $" 世代 {generation}。");
+                   $"（虚拟显示器固定 60Hz；物理屏实测 {request.Physical.MaxRefreshMillihertz} mHz）…… 世代 {generation}。");
         try
         {
             DriverClient.SetConfig(cfg);
@@ -428,7 +436,7 @@ public static class ApplyService
             DisplayArranger.ComputePlacements(physicalNow, layout, virtualMonitors, request.Resolutions);
         string appliedPrimaryDevice = virtualMonitors[0].DeviceName;
         DisplayArranger.ApplyLayout(
-            DisplayArranger.ComposeLayout(current, placements, physical.MaxRefreshHz, appliedPrimaryDevice),
+            DisplayArranger.ComposeLayout(current, placements, VirtualRefreshHz, appliedPrimaryDevice),
             log.Report);
 
         // Re-read so config.json records what Windows actually settled on, keeping the

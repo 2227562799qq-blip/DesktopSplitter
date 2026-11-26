@@ -138,6 +138,22 @@ public static class ApplySelfTest
             SpecializationUi = null,
         };
 
+        // Virtual refresh is fixed at 60 Hz whatever the physical panel reports
+        // (0.6.8: a 32 Hz panel's virtual monitors never got display paths).
+        // BuildDriverConfig must ignore the physical rate entirely.
+        foreach ((uint fakeMhz, int fakeHz) in new[] { (165007u, 165), (32000u, 32) })
+        {
+            MonitorInfo fakePhysical = request.Physical.WithMaxRefresh(fakeMhz, fakeHz);
+            var testCfg = ApplyService.BuildDriverConfig(
+                fakePhysical, request.Layout, request.Resolutions, 999);
+            if (testCfg.Monitors[0].Modes[0].RefreshMillihertz != ApplyService.VirtualRefreshMillihertz)
+            {
+                log.Report($"APPLY-SELF-TEST: fixed virtual refresh FAILED: physical {fakeMhz} mHz -> virtual {testCfg.Monitors[0].Modes[0].RefreshMillihertz} mHz, expected {ApplyService.VirtualRefreshMillihertz} mHz.");
+                return 1;
+            }
+        }
+        log.Report("APPLY-SELF-TEST: fixed virtual refresh ok (165007->60000, 32000->60000).");
+
         Exception? applyError = null;
         ApplyResult? result = null;
         try
@@ -193,7 +209,7 @@ public static class ApplySelfTest
         (bool reproPassed, bool rotationPassed) = RunInactiveRepro(log, request, halfW, height);
 
         // SetDisplayConfig fallback + 60000 mHz phase (0.6.7 round 5): proves
-        // the new arrange fallback end to end at lu's rate. Runs after the
+        // the new arrange fallback end to end at the fixed 60 Hz virtual rate. Runs after the
         // repro phase (which always reverts in its finally) and before the
         // physical mode is restored.
         bool sdcFallbackPassed = RunSdcFallbackCheck(log, request, halfW, height);
