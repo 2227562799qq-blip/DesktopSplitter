@@ -202,6 +202,9 @@ public static class ApplyService
             .Where(m => m.IsDeskSplitVirtual)
             .Select(m => m.DeviceName)
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        log.Report(virtualBaseline.Count == 0
+            ? "点应用前没有已存在的虚拟显示器。"
+            : $"点应用前已有虚拟显示器 {virtualBaseline.Count} 台：{string.Join("、", virtualBaseline.OrderBy(n => DisplayConfig.DeviceIndex(n)))}。");
 
         // Remember which display was primary BEFORE we touch anything — Revert restores
         // exactly this monitor, which is not necessarily the one being split.
@@ -240,7 +243,7 @@ public static class ApplyService
 
         // b. Wait for the virtual monitors to arrive.
         log.Report($"等待 {segmentCount} 台虚拟显示器出现（最多 {MonitorArrivalTimeout.TotalSeconds:0} 秒）……");
-        IReadOnlyList<MonitorInfo> arrived = WaitForVirtualMonitors(segmentCount, virtualBaseline, ct);
+        IReadOnlyList<MonitorInfo> arrived = WaitForVirtualMonitors(segmentCount, virtualBaseline, log, ct);
         foreach (MonitorInfo m in arrived)
         {
             log.Report($"  找到 {m.DeviceName}（{m.FriendlyName}）" +
@@ -1046,11 +1049,20 @@ public static class ApplyService
     /// our EDID cached, and QDC_ALL_PATHS still lists them, so without the
     /// <paramref name="virtualBaseline"/> exclusion the wait sees 4 when it
     /// wants 2 and times out even though the driver created both monitors.
+    /// When more than the expected number show up anyway (duplicates of the
+    /// same EDID index, or other drivers' monitors read as ours), the wait
+    /// also succeeds once every expected EDID index (0..expected-1) is present
+    /// and returns one entry per index — preferring an active path, then the
+    /// highest DISPLAY number (the newest arrival). The duplicate rule only
+    /// applies after 2 seconds so a just-arrived monitor's EDID has time to
+    /// be cached first. On timeout the message lists every monitor found, so
+    /// the next failure names the extras instead of only counting them.
     /// </summary>
     private static IReadOnlyList<MonitorInfo> WaitForVirtualMonitors(
-        int expected, HashSet<string> virtualBaseline, CancellationToken ct)
+        int expected, HashSet<string> virtualBaseline, IProgress<string> log, CancellationToken ct)
     {
-        DateTime deadline = DateTime.UtcNow + MonitorArrivalTimeout;
+        DateTime started = DateTime.UtcNow;
+        DateTime deadline = started + MonitorArrivalTimeout;
         List<MonitorInfo> found = new();
         int preExisting = 0;
 
@@ -1070,6 +1082,14 @@ public static class ApplyService
 
             if (found.Count == expected) return found;
 
+            if (found.Count > expected &&
+                DateTime.UtcNow - started >= TimeSpan.FromSeconds(2) &&
+                TryDedupByEdidIndex(found, expected, out List<MonitorInfo> deduped))
+            {
+                log.Report($"新建的虚拟显示器多于预期（{found.Count} 台），已按 EDID 序列号去重，重复索引取编号最大的。");
+                return deduped;
+            }
+
             ct.WaitHandle.WaitOne(PollInterval);
         }
 
@@ -1077,8 +1097,49 @@ public static class ApplyService
             $"等待虚拟显示器超时（{MonitorArrivalTimeout.TotalSeconds:0} 秒）：" +
             $"应有 {expected} 台，本次新建看到 {found.Count} 台" +
             (preExisting > 0 ? $"（另有 {preExisting} 台以前留下的虚拟显示器未计入）" : "") +
-            $"。{DriverStatusText()}");
+            $"：{DescribeMonitors(found)}。{DriverStatusText()}");
     }
+
+    /// <summary>
+    /// Picks one entry per expected EDID index (0..expected-1) out of a list
+    /// that has more entries than expected. Returns false unless every index
+    /// is represented. Among duplicates of one index, prefer an active path,
+    /// then the highest DISPLAY number (the newest arrival).
+    /// </summary>
+    private static bool TryDedupByEdidIndex(
+        IReadOnlyList<MonitorInfo> found, int expected, out List<MonitorInfo> deduped)
+    {
+        var byIndex = new Dictionary<int, MonitorInfo>();
+        foreach (MonitorInfo m in found)
+        {
+            int index = m.DeskSplitMonitorIndex;
+            if (index < 0 || index >= expected) continue;
+            if (!byIndex.TryGetValue(index, out MonitorInfo? current) ||
+                (!current.IsActivePath && m.IsActivePath) ||
+                (current.IsActivePath == m.IsActivePath &&
+                 DisplayConfig.DeviceIndex(m.DeviceName) > DisplayConfig.DeviceIndex(current.DeviceName)))
+            {
+                byIndex[index] = m;
+            }
+        }
+
+        if (byIndex.Count != expected ||
+            Enumerable.Range(0, expected).Any(i => !byIndex.ContainsKey(i)))
+        {
+            deduped = new List<MonitorInfo>();
+            return false;
+        }
+
+        deduped = Enumerable.Range(0, expected).Select(i => byIndex[i]).ToList();
+        return true;
+    }
+
+    /// <summary>One line per monitor for the timeout message.</summary>
+    private static string DescribeMonitors(IReadOnlyList<MonitorInfo> monitors)
+        => monitors.Count == 0
+            ? "无"
+            : string.Join("；", monitors.Select(m =>
+                $"{m.DeviceName}（索引{(m.DeskSplitMonitorIndex < 0 ? "无EDID" : m.DeskSplitMonitorIndex.ToString())}，{(m.IsActivePath ? "已激活" : "未激活")}）"));
 
     /// <summary>
     /// Driver-side state for the timeout message. The driver is the only one
