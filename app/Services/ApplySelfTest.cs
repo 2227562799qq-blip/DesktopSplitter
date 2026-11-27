@@ -88,7 +88,7 @@ public static class ApplySelfTest
         var targets = new Dictionary<DisplayConfig.Endpoint, (int Width, int Height)> {
             [new(0, 0, first)] = (960, 1080), [new(0, 0, second)] = (960, 1080),
         };
-        var submitted = new HashSet<string>();
+        using var attempt = new DisplayTopology.RoutingAttempt();
         DISPLAYCONFIG_PATH_INFO[]? applied = null;
         DISPLAYCONFIG_MODE_INFO[]? appliedModes = null;
 
@@ -105,13 +105,47 @@ public static class ApplySelfTest
             return ERROR_SUCCESS;
         }
 
-        bool ready = DisplayTopology.ConfigureIndependentSources(paths, modes, targets, names, submitted,
-            log, CancellationToken.None, CheckConfiguration);
+        static int UnexpectedExtend(uint flags) => throw new InvalidOperationException("Unexpected system topology change.");
+        var physical = new DisplayConfig.Endpoint(0, 0, panel);
+        bool ready = DisplayTopology.ConfigureIndependentSources(paths, modes, targets, names, physical, attempt,
+            log, CancellationToken.None, CheckConfiguration, UnexpectedExtend);
         if (ready || applied is null || appliedModes is null ||
-            !DisplayTopology.ConfigureIndependentSources(applied, appliedModes, targets, names, submitted,
-                log, CancellationToken.None, (_, _, _) => throw new InvalidOperationException("Already extended.")))
+            !DisplayTopology.ConfigureIndependentSources(applied, appliedModes, targets, names, physical, attempt,
+                log, CancellationToken.None, (_, _, _) => throw new InvalidOperationException("Already extended."), UnexpectedExtend))
             throw new InvalidOperationException("Clone regression: did not split the two active cloned targets.");
         log.Report("APPLY-SELF-TEST: two virtual targets cloned onto DISPLAY1 -> independent sources PASS.");
+
+        // On the Dell, QDC supplied no unused source at all. Exercise this case
+        // separately from the explicit route proposal above, including rollback.
+        var clonedOnly = paths.Where(p => (p.flags & DISPLAYCONFIG_PATH_ACTIVE) != 0).ToArray();
+        int extendCalls = 0, restores = 0;
+        using (var fallback = new DisplayTopology.RoutingAttempt())
+        {
+            int Extend(uint flags)
+            {
+                if (flags != (SDC_TOPOLOGY_EXTEND | SDC_APPLY)) throw new InvalidOperationException("Invalid EXTEND request.");
+                extendCalls++;
+                return ERROR_SUCCESS;
+            }
+            int Restore(DISPLAYCONFIG_PATH_INFO[] saved, DISPLAYCONFIG_MODE_INFO[] savedModes, uint flags)
+            {
+                if (saved.Length != 1 || saved[0].targetInfo.id != panel || savedModes.Length != 1 ||
+                    savedModes[saved[0].sourceInfo.modeInfoIdx].modeInfo.sourceMode.width != 1920)
+                    throw new InvalidOperationException("Panel rollback lost its original path or mode.");
+                restores++;
+                return ERROR_SUCCESS;
+            }
+            for (int poll = 0; poll < 2; poll++)
+                if (DisplayTopology.ConfigureIndependentSources(clonedOnly, modes, targets, names, physical, fallback,
+                    log, CancellationToken.None, Restore, Extend))
+                    throw new InvalidOperationException("Unchanged cloned topology reported as extended.");
+            if (!DisplayTopology.ConfigureIndependentSources(applied, appliedModes, targets, names, physical, fallback,
+                    log, CancellationToken.None, CheckConfiguration, UnexpectedExtend))
+                throw new InvalidOperationException("Extended readback was not recognized.");
+            // Leave the rollback armed to exercise cancellation after the EXTEND request.
+        }
+        if (extendCalls != 1 || restores != 1) throw new InvalidOperationException("Unexpected EXTEND or rollback count.");
+        log.Report("APPLY-SELF-TEST: zero free sources -> system EXTEND, readback and panel rollback PASS.");
     }
 
     private static int RunCore(Log log)
@@ -553,7 +587,8 @@ public static class ApplySelfTest
         }
         try
         {
-            var desktop = ApplyService.PrepareVirtualDesktop(virtualMonitors, request60.Resolutions, log, CancellationToken.None);
+            var desktop = ApplyService.PrepareVirtualDesktop(virtualMonitors, request60.Resolutions,
+                request60.Physical, log, CancellationToken.None);
             IReadOnlyList<MonitorInfo> current = desktop.Monitors;
             virtualMonitors = desktop.VirtualMonitors;
             MonitorInfo? physicalNow = current.FirstOrDefault(m => !m.IsDeskSplitVirtual);

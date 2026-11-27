@@ -421,11 +421,12 @@ public static class ApplyService
         //    (typically segment 1 already primary and the physical monitor moved left of it),
         //    so positions are computed from where the physical monitor is NOW.
         log.Report("正在虚拟桌面中排列虚拟显示器……");
-        var desktop = PrepareVirtualDesktop(virtualMonitors, request.Resolutions, log, ct);
+        var desktop = PrepareVirtualDesktop(virtualMonitors, request.Resolutions, physical, log, ct);
         IReadOnlyList<MonitorInfo> current = desktop.Monitors;
         virtualMonitors = desktop.VirtualMonitors;
-        MonitorInfo physicalNow = current.FirstOrDefault(m => SameDevice(m.DeviceName, physical.DeviceName))
-            ?? throw new ApplyException($"{physical.DeviceName} 已不再活动，无法把分屏放在它旁边。");
+        MonitorInfo physicalNow = current.First(m => IsSamePhysicalTarget(m, physical));
+        if (SameDevice(previousPrimaryDevice, physical.DeviceName)) previousPrimaryDevice = physicalNow.DeviceName;
+        physical = physicalNow;
         IReadOnlyList<DisplayArranger.VirtualPlacement> placements =
             DisplayArranger.ComputePlacements(physicalNow, layout, virtualMonitors, request.Resolutions);
         string appliedPrimaryDevice = virtualMonitors[0].DeviceName;
@@ -447,7 +448,7 @@ public static class ApplyService
         var compositorConfig = new CompositorConfig
         {
             PhysicalDevice = physical.DeviceName,
-            RefreshMillihertz = physical.MaxRefreshMillihertz,
+            RefreshMillihertz = request.Physical.MaxRefreshMillihertz,
         };
         for (int i = 0; i < segmentCount; i++)
         {
@@ -467,7 +468,7 @@ public static class ApplyService
         //    Ordering matters: the display must already be specialized when dscomp starts, and
         //    only a NON-primary display can be specialized — which is exactly why this runs
         //    after segment 1 was promoted to primary in step c2.
-        (Process compositor, string specializedDevice) = LaunchCompositor(request, log, ct);
+        (Process compositor, string specializedDevice) = LaunchCompositor(request, physical.DeviceName, log, ct);
 
         // f. Remember the settings for next launch / tray "Apply last".
         AppSettings? previousSettings = SettingsStore.Load();
@@ -674,14 +675,14 @@ public static class ApplyService
     /// the monitor off the desktop with nothing drawing to it.
     /// </summary>
     private static (Process Compositor, string SpecializedDevice) LaunchCompositor(
-        ApplyRequest request, IProgress<string> log, CancellationToken ct)
+        ApplyRequest request, string physicalDevice, IProgress<string> log, CancellationToken ct)
     {
         if (!request.HidePhysicalDisplay) return (StartPlain(log), string.Empty);
 
-        MonitorInfo? physical = FindLive(request.Physical.DeviceName);
+        MonitorInfo? physical = FindLive(physicalDevice);
         if (physical is null)
         {
-            log.Report($"警告：{request.Physical.DeviceName} 已消失；以普通方式启动合成器。");
+            log.Report($"警告：{physicalDevice} 已消失；以普通方式启动合成器。");
             return (StartPlain(log), string.Empty);
         }
 
@@ -1205,13 +1206,18 @@ public static class ApplyService
         return matches.Count == 1 ? matches[0] : null;
     }
 
+    private static bool IsSamePhysicalTarget(MonitorInfo current, MonitorInfo original)
+        => !current.IsDeskSplitVirtual && (current.DisplayTarget == original.DisplayTarget ||
+           (!string.IsNullOrEmpty(original.MonitorDevicePath) &&
+            SameDevice(current.MonitorDevicePath, original.MonitorDevicePath)));
+
     internal static (IReadOnlyList<MonitorInfo> Monitors, IReadOnlyList<MonitorInfo> VirtualMonitors) PrepareVirtualDesktop(
         IReadOnlyList<MonitorInfo> monitors, IReadOnlyList<(int Width, int Height)> sizes,
-        IProgress<string> log, CancellationToken ct)
+        MonitorInfo physical, IProgress<string> log, CancellationToken ct)
     {
         DateTime deadline = DateTime.UtcNow + MonitorArrivalTimeout;
         string lastProblem = "等待虚拟目标就绪";
-        var submitted = new HashSet<string>();
+        using var attempt = new DisplayTopology.RoutingAttempt();
         while (DateTime.UtcNow < deadline)
         {
             ct.ThrowIfCancellationRequested();
@@ -1222,8 +1228,14 @@ public static class ApplyService
                 if (mapped.All(m => m is not null) && mapped.Select(m => m!.DisplayTarget).Distinct().Count() == monitors.Count)
                 {
                     var targets = mapped.Select(m => m!).ToList();
-                    if (DisplayTopology.EnsureIndependentSources(targets, sizes, submitted, log, ct))
-                        return ReadActiveDesktop(targets, log, ct);
+                    if (DisplayTopology.EnsureIndependentSources(targets, sizes, physical.DisplayTarget, attempt, log, ct))
+                    {
+                        var desktop = ReadActiveDesktop(targets, log, ct);
+                        if (!desktop.Monitors.Any(m => IsSamePhysicalTarget(m, physical)))
+                            throw new ApplyException("等待原物理显示器恢复到活动桌面。");
+                        attempt.RestorePanel = null;
+                        return desktop;
+                    }
                     lastProblem = "Windows 已接受路径，等待读回独立显示源";
                 }
                 else lastProblem = $"等待原有目标或对应的 EDID 重新出现，当前目标：{DescribeMonitors(connected)}";

@@ -8,26 +8,37 @@ namespace DesktopSplitter.Interop;
 /// </summary>
 public static class DisplayTopology
 {
+    internal sealed class RoutingAttempt : IDisposable
+    {
+        internal HashSet<string> Submitted { get; } = new();
+        internal string? LastPathReport { get; set; }
+        internal int? ExtendResult { get; set; }
+        internal Action? RestorePanel { get; set; }
+        public void Dispose() => RestorePanel?.Invoke();
+    }
+
     // True once the queried desktop confirms that each target has its own source.
     internal static bool EnsureIndependentSources(
         IReadOnlyList<MonitorInfo> monitors, IReadOnlyList<(int Width, int Height)> sizes,
-        HashSet<string> submitted, IProgress<string> log, CancellationToken ct)
+        DisplayConfig.Endpoint physical, RoutingAttempt attempt, IProgress<string> log, CancellationToken ct)
     {
         (DISPLAYCONFIG_PATH_INFO[] paths, DISPLAYCONFIG_MODE_INFO[] modes) = DisplayConfig.QueryAllConfig();
         var requested = monitors.Select((m, i) => (m.DisplayTarget, Size: sizes[i]))
             .ToDictionary(entry => entry.DisplayTarget, entry => entry.Size);
         var names = paths.DistinctBy(Source).ToDictionary(Source, DisplayConfig.GetSourceGdiName);
-        return ConfigureIndependentSources(paths, modes, requested, names, submitted, log, ct,
+        return ConfigureIndependentSources(paths, modes, requested, names, physical, attempt, log, ct,
             (config, modeArray, flags) => SetDisplayConfig((uint)config.Length, config,
-                (uint)modeArray.Length, modeArray, flags));
+                (uint)modeArray.Length, modeArray, flags),
+            flags => SetDisplayConfig(0, null, 0, null, flags));
     }
 
     internal static bool ConfigureIndependentSources(
         DISPLAYCONFIG_PATH_INFO[] paths, DISPLAYCONFIG_MODE_INFO[] modes,
         IReadOnlyDictionary<DisplayConfig.Endpoint, (int Width, int Height)> sizes,
-        IReadOnlyDictionary<DisplayConfig.Endpoint, string> names, HashSet<string> submitted,
+        IReadOnlyDictionary<DisplayConfig.Endpoint, string> names, DisplayConfig.Endpoint physical, RoutingAttempt attempt,
         IProgress<string> log, CancellationToken ct,
-        Func<DISPLAYCONFIG_PATH_INFO[], DISPLAYCONFIG_MODE_INFO[], uint, int> setConfig)
+        Func<DISPLAYCONFIG_PATH_INFO[], DISPLAYCONFIG_MODE_INFO[], uint, int> setConfig,
+        Func<uint, int> setTopology)
     {
         var active = paths.Where(p => (p.flags & DISPLAYCONFIG_PATH_ACTIVE) != 0).ToList();
         var requested = sizes.Keys.ToHashSet();
@@ -78,16 +89,55 @@ public static class DisplayTopology
             })
             .OrderBy(c => c.Paths.Length)
             .ToArray();
-        log.Report("正在为虚拟屏分配独立显示源：" +
-                   string.Join("、", candidates.Select(c => $"目标 {c.Target} 有 {c.Paths.Length} 条候选路径")) + "。");
+        string report = string.Join("、", candidates.Select(c => $"目标 {c.Target} 有 {c.Paths.Length} 条候选路径"));
+        if (candidates.Any(c => c.Paths.Length == 0))
+        {
+            report += "。筛选前：" + string.Join("；", paths.Where(p => requested.Contains(Target(p)))
+                .Select(p => $"{Target(p)} ← {Source(p)} {names[Source(p)]} " +
+                    $"可用={p.targetInfo.targetAvailable} 活动={(p.flags & DISPLAYCONFIG_PATH_ACTIVE) != 0} " +
+                    $"源已占用={occupiedSources.Contains(Source(p))}"));
+            report += "。其他已连接或活动的目标：" + string.Join("、", paths.Where(p => !requested.Contains(Target(p)) &&
+                (p.targetInfo.targetAvailable || (p.flags & DISPLAYCONFIG_PATH_ACTIVE) != 0))
+                .Select(Target).Distinct());
+        }
+        if (attempt.LastPathReport != report)
+        {
+            log.Report("正在为虚拟屏分配独立显示源：" + report + "。");
+            attempt.LastPathReport = report;
+        }
 
         // Give each virtual source its own desktop rectangle. Windows picks the target
         // timing from the modes advertised by the driver.
         const uint flags = SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES;
         const int maxAttempts = 24;
         int attempts = 0;
-        var considered = new HashSet<string>(submitted);
+        var considered = new HashSet<string>(attempt.Submitted);
         if (TryActivate(0, false) || TryActivate(0, true)) return false;
+
+        // EXTEND is a system-wide request. Use it only when the single retained
+        // panel and our requested targets account for every available output.
+        if (attempts == 0 && attempt.Submitted.Count == 0 && activePaths.Count == 1 && Target(activePaths[0]) == physical &&
+            paths.Where(p => p.targetInfo.targetAvailable)
+                .All(p => requested.Contains(Target(p)) || Target(p) == physical) &&
+            requested.All(t => paths.Any(p => Target(p) == t && p.targetInfo.targetAvailable)))
+        {
+            if (attempt.ExtendResult is null)
+            {
+                ct.ThrowIfCancellationRequested();
+                // Keep the panel configuration from BEFORE asking Windows to
+                // allocate new sources. The next poll can have different mode IDs.
+                var panel = activePaths.ToArray();
+                var panelModes = retainedModes.ToArray();
+                int rc = setTopology(SDC_APPLY | SDC_TOPOLOGY_EXTEND);
+                attempt.ExtendResult = rc;
+                log.Report($"  请求 Windows 切换到扩展桌面，SetDisplayConfig(EXTEND) 返回 {rc}。");
+                if (rc == ERROR_SUCCESS)
+                    attempt.RestorePanel = () => log.Report($"  恢复原物理屏配置，Win32 返回 " +
+                        $"{setConfig(panel, panelModes, SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_APPLY | SDC_ALLOW_CHANGES)}。");
+            }
+            if (attempt.ExtendResult == ERROR_SUCCESS) return false;
+            throw new DisplayArrangeException($"Windows 扩展桌面请求失败，Win32 错误 {attempt.ExtendResult}。");
+        }
 
         throw new DisplayArrangeException(attempts == 0
             ? "无法激活虚拟显示路径：找不到一组可同时使用的显示源。"
@@ -148,7 +198,7 @@ public static class DisplayTopology
                     return false;
                 }
 
-                submitted.Add(routes);
+                attempt.Submitted.Add(routes);
                 log.Report("  Windows 已接受独立显示路径：" + routes + "。");
                 return true;
             }
