@@ -8,74 +8,160 @@ namespace DesktopSplitter.Interop;
 /// </summary>
 public static class DisplayTopology
 {
-    internal static void ActivateVirtualTargets(
-        IReadOnlyList<MonitorInfo> monitors, IProgress<string> log, CancellationToken ct)
+    // True once the queried desktop confirms that each target has its own source.
+    internal static bool EnsureIndependentSources(
+        IReadOnlyList<MonitorInfo> monitors, IReadOnlyList<(int Width, int Height)> sizes,
+        HashSet<string> submitted, IProgress<string> log, CancellationToken ct)
     {
-        if (monitors.All(m => m.IsActivePath)) return;
-
         (DISPLAYCONFIG_PATH_INFO[] paths, DISPLAYCONFIG_MODE_INFO[] modes) = DisplayConfig.QueryAllConfig();
-        var activePaths = paths.Where(p => (p.flags & DISPLAYCONFIG_PATH_ACTIVE) != 0).ToList();
-        var activeTargets = activePaths.Select(Target).ToHashSet();
-        var occupiedSources = activePaths.Select(Source).ToHashSet();
-        var missing = monitors.Select(m => m.DisplayTarget).Where(t => !activeTargets.Contains(t)).ToList();
-        if (missing.Count == 0) return;
+        var requested = monitors.Select((m, i) => (m.DisplayTarget, Size: sizes[i]))
+            .ToDictionary(entry => entry.DisplayTarget, entry => entry.Size);
+        var names = paths.DistinctBy(Source).ToDictionary(Source, DisplayConfig.GetSourceGdiName);
+        return ConfigureIndependentSources(paths, modes, requested, names, submitted, log, ct,
+            (config, modeArray, flags) => SetDisplayConfig((uint)config.Length, config,
+                (uint)modeArray.Length, modeArray, flags));
+    }
 
-        var candidates = missing
+    internal static bool ConfigureIndependentSources(
+        DISPLAYCONFIG_PATH_INFO[] paths, DISPLAYCONFIG_MODE_INFO[] modes,
+        IReadOnlyDictionary<DisplayConfig.Endpoint, (int Width, int Height)> sizes,
+        IReadOnlyDictionary<DisplayConfig.Endpoint, string> names, HashSet<string> submitted,
+        IProgress<string> log, CancellationToken ct,
+        Func<DISPLAYCONFIG_PATH_INFO[], DISPLAYCONFIG_MODE_INFO[], uint, int> setConfig)
+    {
+        var active = paths.Where(p => (p.flags & DISPLAYCONFIG_PATH_ACTIVE) != 0).ToList();
+        var requested = sizes.Keys.ToHashSet();
+        if (HaveIndependentSources(active, requested, names)) return true;
+
+        // Keep unrelated displays (including existing clone groups) exactly once.
+        // An active path to one of our targets may be a clone of the laptop panel.
+        // Replace its old route in the same SDC call that attaches its new one.
+        var activePaths = active.Where(p => !requested.Contains(Target(p))).ToList();
+        var occupiedSources = activePaths.Select(Source).ToHashSet();
+        var occupiedNames = activePaths.Select(p => names[Source(p)])
+            .Where(n => n.Length > 0).ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        // Drop modes belonging only to the routes being replaced. Clone paths
+        // that remain must continue to reference the same source mode index.
+        var retainedModes = new List<DISPLAYCONFIG_MODE_INFO>();
+        var modeIndices = new Dictionary<uint, uint>();
+        uint Retain(uint old)
+        {
+            if (old == DISPLAYCONFIG_PATH_MODE_IDX_INVALID) return old;
+            if (!modeIndices.TryGetValue(old, out uint index))
+            {
+                index = (uint)retainedModes.Count;
+                retainedModes.Add(modes[old]);
+                modeIndices.Add(old, index);
+            }
+            return index;
+        }
+        for (int i = 0; i < activePaths.Count; i++)
+        {
+            var p = activePaths[i];
+            p.sourceInfo.modeInfoIdx = Retain(p.sourceInfo.modeInfoIdx);
+            p.targetInfo.modeInfoIdx = Retain(p.targetInfo.modeInfoIdx);
+            activePaths[i] = p;
+        }
+        var edge = retainedModes.Where(m => m.infoType == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE)
+            .Select(m => m.modeInfo.sourceMode)
+            .OrderByDescending(m => m.position.x + (int)m.width).FirstOrDefault();
+
+        var candidates = requested
             .Select(t => new
             {
                 Target = t,
                 Paths = paths.Where(p => p.targetInfo.targetAvailable && Target(p) == t &&
-                                         !occupiedSources.Contains(Source(p))).ToArray(),
+                                         !occupiedSources.Contains(Source(p)))
+                    .OrderByDescending(p => names[Source(p)].Length > 0)
+                    .ThenByDescending(p => (p.flags & DISPLAYCONFIG_PATH_ACTIVE) != 0).ToArray(),
             })
             .OrderBy(c => c.Paths.Length)
             .ToArray();
-        log.Report("正在激活虚拟显示路径：" +
+        log.Report("正在为虚拟屏分配独立显示源：" +
                    string.Join("、", candidates.Select(c => $"目标 {c.Target} 有 {c.Paths.Length} 条候选路径")) + "。");
 
-        // Keep every active path and its existing mode indices. For a new path, let Windows
-        // choose the initial source and target modes from the driver's advertised modes.
-        // Several targets can offer the same source. An extended desktop needs distinct sources.
+        // Give each virtual source its own desktop rectangle. Windows picks the target
+        // timing from the modes advertised by the driver.
         const uint flags = SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES;
         const int maxAttempts = 24;
         int attempts = 0;
-        if (TryActivate(0)) return;
+        var considered = new HashSet<string>(submitted);
+        if (TryActivate(0, false) || TryActivate(0, true)) return false;
 
         throw new DisplayArrangeException(attempts == 0
             ? "无法激活虚拟显示路径：找不到一组可同时使用的显示源。"
             : $"无法激活虚拟显示路径：SetDisplayConfig 尝试了 {attempts} 组路径，请查看上方 Win32 错误。");
 
-        bool TryActivate(int index)
+        bool TryActivate(int index, bool allowProvisionalNames)
         {
             ct.ThrowIfCancellationRequested();
             if (attempts >= maxAttempts) return false;
             if (index == candidates.Length)
             {
-                attempts++;
                 var configuration = activePaths.ToArray();
-                int rc = SetDisplayConfig((uint)configuration.Length, configuration,
-                    (uint)modes.Length, modes, flags | SDC_VALIDATE);
+                string routes = string.Join("、", configuration.Where(p => requested.Contains(Target(p)))
+                    .OrderBy(p => Target(p).ToString(), StringComparer.Ordinal)
+                    .Select(p => $"{Target(p)} → 源 {Source(p)}"));
+                if (!considered.Add(routes)) return false;
+                attempts++;
+                var supplied = new List<DISPLAYCONFIG_MODE_INFO>(retainedModes);
+                int nextX = edge.position.x + (int)edge.width;
+                for (int i = 0; i < configuration.Length; i++)
+                {
+                    ref var p = ref configuration[i];
+                    if (!sizes.TryGetValue(Target(p), out var size)) continue;
+                    p.sourceInfo.modeInfoIdx = (uint)supplied.Count;
+                    supplied.Add(new DISPLAYCONFIG_MODE_INFO {
+                        infoType = DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE, adapterId = p.sourceInfo.adapterId,
+                        id = p.sourceInfo.id,
+                        modeInfo = new() { sourceMode = new() {
+                            width = (uint)size.Width, height = (uint)size.Height,
+                            pixelFormat = DISPLAYCONFIG_PIXELFORMAT_32BPP,
+                            position = new() { x = nextX, y = edge.position.y },
+                        } },
+                    });
+                    nextX += size.Width;
+                }
+                var modeArray = supplied.ToArray();
+                int rc = setConfig(configuration, modeArray, flags | SDC_VALIDATE);
+                if (rc != ERROR_SUCCESS)
+                {
+                    // Keep the independent routes and let Windows position the new sources
+                    // if it cannot fit the temporary row into the existing desktop.
+                    for (int i = 0; i < configuration.Length; i++)
+                        if (requested.Contains(Target(configuration[i])))
+                            configuration[i].sourceInfo.modeInfoIdx = DISPLAYCONFIG_PATH_MODE_IDX_INVALID;
+                    modeArray = retainedModes.ToArray();
+                    rc = setConfig(configuration, modeArray, flags | SDC_VALIDATE);
+                }
                 if (rc != ERROR_SUCCESS)
                 {
                     log.Report($"  激活第 {attempts} 组路径：SetDisplayConfig 验证返回 Win32 错误 {rc}。");
                     return false;
                 }
 
-                rc = SetDisplayConfig((uint)configuration.Length, configuration,
-                    (uint)modes.Length, modes, flags | SDC_APPLY);
+                rc = setConfig(configuration, modeArray, flags | SDC_APPLY);
                 if (rc != ERROR_SUCCESS)
                 {
                     log.Report($"  激活第 {attempts} 组路径：SetDisplayConfig 应用返回 Win32 错误 {rc}。");
                     return false;
                 }
 
-                log.Report($"  已激活 {missing.Count} 台虚拟显示器，正在读取实际显示设备名称。");
+                submitted.Add(routes);
+                log.Report("  Windows 已接受独立显示路径：" + routes + "。");
                 return true;
             }
 
             foreach (DISPLAYCONFIG_PATH_INFO candidate in candidates[index].Paths)
             {
                 DisplayConfig.Endpoint source = Source(candidate);
+                string name = names[source];
+                // Source names may still reflect the old topology. Only try aliases
+                // after unambiguous names, with distinct source IDs and live readback.
+                if (occupiedNames.Contains(name) && !allowProvisionalNames) continue;
                 if (!occupiedSources.Add(source)) continue;
+                bool reservedName = name.Length > 0 && occupiedNames.Add(name);
 
                 DISPLAYCONFIG_PATH_INFO path = candidate;
                 path.flags = DISPLAYCONFIG_PATH_ACTIVE;
@@ -88,19 +174,30 @@ public static class DisplayTopology
                 path.targetInfo.scanLineOrdering = 0;
                 path.targetInfo.statusFlags = 0;
                 activePaths.Add(path);
-                if (TryActivate(index + 1)) return true;
+                if (TryActivate(index + 1, allowProvisionalNames)) return true;
                 activePaths.RemoveAt(activePaths.Count - 1);
                 occupiedSources.Remove(source);
+                if (reservedName) occupiedNames.Remove(name);
                 if (attempts >= maxAttempts) break;
             }
             return false;
         }
+    }
 
-        static DisplayConfig.Endpoint Source(DISPLAYCONFIG_PATH_INFO path)
-            => DisplayConfig.Endpoint.From(path.sourceInfo.adapterId, path.sourceInfo.id);
+    private static DisplayConfig.Endpoint Source(DISPLAYCONFIG_PATH_INFO path)
+        => DisplayConfig.Endpoint.From(path.sourceInfo.adapterId, path.sourceInfo.id);
 
-        static DisplayConfig.Endpoint Target(DISPLAYCONFIG_PATH_INFO path)
-            => DisplayConfig.Endpoint.From(path.targetInfo.adapterId, path.targetInfo.id);
+    private static DisplayConfig.Endpoint Target(DISPLAYCONFIG_PATH_INFO path)
+        => DisplayConfig.Endpoint.From(path.targetInfo.adapterId, path.targetInfo.id);
+
+    private static bool HaveIndependentSources(IReadOnlyList<DISPLAYCONFIG_PATH_INFO> active,
+        HashSet<DisplayConfig.Endpoint> requested, IReadOnlyDictionary<DisplayConfig.Endpoint, string> names)
+    {
+        var virtualPaths = active.Where(p => requested.Contains(Target(p))).ToList();
+        if (!requested.SetEquals(virtualPaths.Select(Target))) return false;
+        return virtualPaths.All(v => names[Source(v)].Length > 0 && active.Count(p =>
+            Source(p) == Source(v) || string.Equals(names[Source(p)], names[Source(v)],
+                StringComparison.OrdinalIgnoreCase)) == 1);
     }
 
     /// <summary>

@@ -411,7 +411,6 @@ public static class ApplyService
         // monitors (see CreateVirtualMonitors; production claims a fresh
         // generation every apply).
         IReadOnlyList<MonitorInfo> virtualMonitors = CreateVirtualMonitors(request, log, ct);
-        DisplayTopology.ActivateVirtualTargets(virtualMonitors, log, ct);
 
         // c. Arrange them contiguously to the right of the physical monitor and promote
         //    segment 1's virtual monitor to PRIMARY, in one batch. The shell anchors the Start
@@ -422,7 +421,7 @@ public static class ApplyService
         //    (typically segment 1 already primary and the physical monitor moved left of it),
         //    so positions are computed from where the physical monitor is NOW.
         log.Report("正在虚拟桌面中排列虚拟显示器……");
-        var desktop = ReadActiveDesktop(virtualMonitors, log, ct);
+        var desktop = PrepareVirtualDesktop(virtualMonitors, request.Resolutions, log, ct);
         IReadOnlyList<MonitorInfo> current = desktop.Monitors;
         virtualMonitors = desktop.VirtualMonitors;
         MonitorInfo physicalNow = current.FirstOrDefault(m => SameDevice(m.DeviceName, physical.DeviceName))
@@ -1170,10 +1169,10 @@ public static class ApplyService
         {
             ct.ThrowIfCancellationRequested();
             IReadOnlyList<MonitorInfo> current = SafeEnumerate();
-            var live = virtualMonitors.Select(v => current.FirstOrDefault(m =>
-                m.DisplayTarget == v.DisplayTarget && m.IsDeskSplitVirtual &&
-                m.CurrentWidth > 0 && m.CurrentHeight > 0)).ToList();
-            if (live.All(m => m is not null))
+            var usable = current.Where(m => m.IsDeskSplitVirtual && m.CurrentWidth > 0 && m.CurrentHeight > 0).ToList();
+            var live = virtualMonitors.Select(v => FindVirtualTarget(v, usable)).ToList();
+            if (live.All(m => m is not null) &&
+                live.Select(m => m!.DeviceName).Distinct(StringComparer.OrdinalIgnoreCase).Count() == virtualMonitors.Count)
             {
                 var resolved = live.Select(m => m!).ToList();
                 for (int i = 0; i < resolved.Count; i++)
@@ -1187,11 +1186,55 @@ public static class ApplyService
             if (DateTime.UtcNow >= deadline)
             {
                 int missing = live.FindIndex(m => m is null);
+                if (missing < 0) throw new ApplyException("虚拟目标仍共用同一活动显示源。");
                 throw new ApplyException(
                     $"分区 {missing + 1} 的虚拟显示目标 {virtualMonitors[missing].DisplayTarget} 没有可用的活动路径。");
             }
             ct.WaitHandle.WaitOne(PollInterval);
         }
+    }
+
+    private static MonitorInfo? FindVirtualTarget(MonitorInfo wanted, IReadOnlyList<MonitorInfo> candidates)
+    {
+        var exact = candidates.FirstOrDefault(m => m.DisplayTarget == wanted.DisplayTarget &&
+            (wanted.Edid is null || m.Edid is null || m.Edid == wanted.Edid));
+        if (exact is not null || !DisplayConfig.IsDeskSplitEdid(wanted.Edid)) return exact;
+        // A topology change can replace the adapter/target pair after arrival.
+        // Only a unique EDID from this generation may carry the segment across.
+        var matches = candidates.Where(m => m.Edid == wanted.Edid).Take(2).ToList();
+        return matches.Count == 1 ? matches[0] : null;
+    }
+
+    internal static (IReadOnlyList<MonitorInfo> Monitors, IReadOnlyList<MonitorInfo> VirtualMonitors) PrepareVirtualDesktop(
+        IReadOnlyList<MonitorInfo> monitors, IReadOnlyList<(int Width, int Height)> sizes,
+        IProgress<string> log, CancellationToken ct)
+    {
+        DateTime deadline = DateTime.UtcNow + MonitorArrivalTimeout;
+        string lastProblem = "等待虚拟目标就绪";
+        var submitted = new HashSet<string>();
+        while (DateTime.UtcNow < deadline)
+        {
+            ct.ThrowIfCancellationRequested();
+            try
+            {
+                var connected = DisplayConfig.EnumerateConnectedVirtualTargets();
+                var mapped = monitors.Select(m => FindVirtualTarget(m, connected)).ToList();
+                if (mapped.All(m => m is not null) && mapped.Select(m => m!.DisplayTarget).Distinct().Count() == monitors.Count)
+                {
+                    var targets = mapped.Select(m => m!).ToList();
+                    if (DisplayTopology.EnsureIndependentSources(targets, sizes, submitted, log, ct))
+                        return ReadActiveDesktop(targets, log, ct);
+                    lastProblem = "Windows 已接受路径，等待读回独立显示源";
+                }
+                else lastProblem = $"等待原有目标或对应的 EDID 重新出现，当前目标：{DescribeMonitors(connected)}";
+            }
+            catch (Exception ex) when (ex is DisplayConfigException or DisplayArrangeException or ApplyException)
+            {
+                lastProblem = ex.Message;
+            }
+            ct.WaitHandle.WaitOne(PollInterval);
+        }
+        throw new ApplyException($"无法为每个虚拟屏建立独立桌面：{lastProblem}");
     }
 
     private static string DisplayPathName(MonitorInfo monitor)

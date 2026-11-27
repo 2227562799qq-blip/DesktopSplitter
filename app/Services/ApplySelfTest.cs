@@ -64,9 +64,60 @@ public static class ApplySelfTest
         }
     }
 
+    // The cloud runner normally extends new monitors automatically. Replay the Dell
+    // snapshot where the panel and both virtual targets are active on DISPLAY1.
+    private static void CheckClonedVirtualTargets(Log log)
+    {
+        static DISPLAYCONFIG_PATH_INFO PathFor(uint target, uint source, bool active) => new()
+        {
+            sourceInfo = new() { id = source, modeInfoIdx = active ? 1u : DISPLAYCONFIG_PATH_MODE_IDX_INVALID },
+            targetInfo = new() { id = target, targetAvailable = true, modeInfoIdx = DISPLAYCONFIG_PATH_MODE_IDX_INVALID },
+            flags = active ? DISPLAYCONFIG_PATH_ACTIVE : 0,
+        };
+
+        const uint panel = 10, first = 318767360, second = 352321793;
+        var paths = new[] {
+            PathFor(panel, 0, true), PathFor(first, 0, true), PathFor(second, 0, true),
+            PathFor(first, 1, false), PathFor(second, 1, false), PathFor(second, 2, false),
+        };
+        var modes = new DISPLAYCONFIG_MODE_INFO[2];
+        modes[1].infoType = DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE;
+        modes[1].modeInfo.sourceMode.width = 1920;
+        var names = Enumerable.Range(0, 3).ToDictionary(i => new DisplayConfig.Endpoint(0, 0, (uint)i),
+            i => $@"\\.\DISPLAY{i + 1}");
+        var targets = new Dictionary<DisplayConfig.Endpoint, (int Width, int Height)> {
+            [new(0, 0, first)] = (960, 1080), [new(0, 0, second)] = (960, 1080),
+        };
+        var submitted = new HashSet<string>();
+        DISPLAYCONFIG_PATH_INFO[]? applied = null;
+        DISPLAYCONFIG_MODE_INFO[]? appliedModes = null;
+
+        int CheckConfiguration(DISPLAYCONFIG_PATH_INFO[] proposal, DISPLAYCONFIG_MODE_INFO[] supplied, uint flags)
+        {
+            if (proposal.Length != 3 || proposal.Select(p => p.sourceInfo.id).Distinct().Count() != 3 ||
+                !proposal.Select(p => p.targetInfo.id).ToHashSet().SetEquals(new[] { panel, first, second }) ||
+                !proposal.Any(p => p.targetInfo.id == panel && p.sourceInfo.id == 0 && p.sourceInfo.modeInfoIdx == 0) ||
+                supplied.Length != 3 || supplied[0].infoType != DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE ||
+                !supplied.Skip(1).Select(m => m.modeInfo.sourceMode.position.x).SequenceEqual(new[] { 1920, 2880 }) ||
+                proposal.Any(p => supplied[p.sourceInfo.modeInfoIdx].id != p.sourceInfo.id))
+                throw new InvalidOperationException("Clone regression: invalid extended desktop proposal.");
+            if ((flags & SDC_APPLY) != 0) { applied = proposal; appliedModes = supplied; }
+            return ERROR_SUCCESS;
+        }
+
+        bool ready = DisplayTopology.ConfigureIndependentSources(paths, modes, targets, names, submitted,
+            log, CancellationToken.None, CheckConfiguration);
+        if (ready || applied is null || appliedModes is null ||
+            !DisplayTopology.ConfigureIndependentSources(applied, appliedModes, targets, names, submitted,
+                log, CancellationToken.None, (_, _, _) => throw new InvalidOperationException("Already extended.")))
+            throw new InvalidOperationException("Clone regression: did not split the two active cloned targets.");
+        log.Report("APPLY-SELF-TEST: two virtual targets cloned onto DISPLAY1 -> independent sources PASS.");
+    }
+
     private static int RunCore(Log log)
     {
         log.Report("APPLY-SELF-TEST: headless end-to-end apply (2-way split).");
+        CheckClonedVirtualTargets(log);
 
         // The driver reports the rate Apply sends it as the virtual monitor's only
         // mode, and a DEVMODE can only ask for whole hertz. Guard the rounding
@@ -502,8 +553,7 @@ public static class ApplySelfTest
         }
         try
         {
-            DisplayTopology.ActivateVirtualTargets(virtualMonitors, log, CancellationToken.None);
-            var desktop = ApplyService.ReadActiveDesktop(virtualMonitors, log, CancellationToken.None);
+            var desktop = ApplyService.PrepareVirtualDesktop(virtualMonitors, request60.Resolutions, log, CancellationToken.None);
             IReadOnlyList<MonitorInfo> current = desktop.Monitors;
             virtualMonitors = desktop.VirtualMonitors;
             MonitorInfo? physicalNow = current.FirstOrDefault(m => !m.IsDeskSplitVirtual);

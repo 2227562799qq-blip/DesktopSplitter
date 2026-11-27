@@ -298,7 +298,7 @@ public static class DisplayConfig
             "QueryDisplayConfig 持续以 ERROR_INSUFFICIENT_BUFFER 失败——显示拓扑正在变化。");
     }
 
-    private static string GetSourceGdiName(DISPLAYCONFIG_PATH_INFO path)
+    internal static string GetSourceGdiName(DISPLAYCONFIG_PATH_INFO path)
     {
         var req = default(DISPLAYCONFIG_SOURCE_DEVICE_NAME);
         req.viewGdiDeviceName = string.Empty;
