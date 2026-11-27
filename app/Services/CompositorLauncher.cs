@@ -1,5 +1,7 @@
 using System.Diagnostics;
 using System.IO;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
 using System.Threading;
 
 namespace DesktopSplitter.Services;
@@ -27,16 +29,24 @@ public static class CompositorLauncher
     /// </summary>
     public const string SpecializedLiveEventName = @"Global\DeskSplitSpecializedLive";
 
-    /// <summary>
-    /// The compositor signals this after it has presented real captured frames on EVERY segment
-    /// for several consecutive frames. Unlike a first Present — which can be an all-black clear
-    /// when no capture has delivered yet — this proves the user can actually see the split
-    /// content. It is what the apply countdown's auto-keep waits for.
-    /// </summary>
-    public const string ContentLiveEventName = @"Global\DeskSplitContentLive";
+    internal static string ContentLiveEventName(int pid) => $@"Local\DeskSplitContentLive.{pid}";
 
-    /// <summary>Session-local fallback: the compositor creates the event here when Global is unavailable.</summary>
-    private const string ContentLiveEventNameLocal = @"Local\DeskSplitContentLive";
+    [DllImport("kernel32.dll", ExactSpelling = true, CharSet = CharSet.Unicode)]
+    private static extern SafeWaitHandle OpenEventW(uint access, bool inheritHandle, string name);
+
+    private sealed class WaitOnlyEvent : WaitHandle
+    {
+        public WaitOnlyEvent(SafeWaitHandle handle) => SafeWaitHandle = handle;
+    }
+
+    internal static WaitHandle? OpenForWait(string name)
+    {
+        const uint Synchronize = 0x00100000;
+        SafeWaitHandle handle = OpenEventW(Synchronize, false, name);
+        if (!handle.IsInvalid) return new WaitOnlyEvent(handle);
+        handle.Dispose();
+        return null;
+    }
 
     /// <summary>Command-line switch that forces the specialized presenter for one run.</summary>
     public const string SpecializedArgument = "--specialized";
@@ -68,27 +78,6 @@ public static class CompositorLauncher
         CompositorExited,
 
         /// <summary>Nothing was signalled inside the deadline.</summary>
-        TimedOut,
-    }
-
-    /// <summary>Outcome of waiting for the compositor to confirm visible content.</summary>
-    public enum ContentLiveWait
-    {
-        /// <summary>The compositor presented real frames on every segment.</summary>
-        Live,
-
-        /// <summary>The compositor exited before confirming.</summary>
-        CompositorExited,
-
-        /// <summary>Nothing was signalled inside the deadline.</summary>
-        TimedOut,
-    }
-
-    /// <summary>Shared outcome of waiting on a compositor liveness event.</summary>
-    private enum LiveWait
-    {
-        Live,
-        CompositorExited,
         TimedOut,
     }
 
@@ -179,88 +168,29 @@ public static class CompositorLauncher
     /// </summary>
     public static SpecializedWait WaitForSpecializedLive(
         Process compositor, TimeSpan timeout, CancellationToken ct, Action<string>? log = null)
-        => WaitForLiveEvent(compositor, new[] { SpecializedLiveEventName }, "确认专用化输出",
-                            timeout, ct, log) switch
-        {
-            LiveWait.Live => SpecializedWait.Live,
-            LiveWait.CompositorExited => SpecializedWait.CompositorExited,
-            _ => SpecializedWait.TimedOut,
-        };
-
-    /// <summary>
-    /// Waits for the compositor to signal <see cref="ContentLiveEventName"/> — real captured
-    /// frames presented on every segment — while watching for it dying first. The compositor
-    /// creates the event in the Global namespace when it can and in the session-local one
-    /// otherwise, so both are tried in that order.
-    /// </summary>
-    public static ContentLiveWait WaitForContentLive(
-        Process compositor, TimeSpan timeout, CancellationToken ct, Action<string>? log = null)
-        => WaitForLiveEvent(compositor,
-                            new[] { ContentLiveEventName, ContentLiveEventNameLocal }, "确认内容画面",
-                            timeout, ct, log) switch
-        {
-            LiveWait.Live => ContentLiveWait.Live,
-            LiveWait.CompositorExited => ContentLiveWait.CompositorExited,
-            _ => ContentLiveWait.TimedOut,
-        };
-
-    /// <summary>
-    /// Waits for the compositor to signal one of <paramref name="candidateNames"/>, while
-    /// watching for it dying first. Any early exit is treated as failure regardless of the exit
-    /// code, so this stays correct whatever code the compositor reserves for a post-acquisition
-    /// failure; the code itself is logged.
-    /// </summary>
-    private static LiveWait WaitForLiveEvent(
-        Process compositor, string[] candidateNames, string purpose,
-        TimeSpan timeout, CancellationToken ct, Action<string>? log = null)
     {
-        DateTime deadline = DateTime.UtcNow + timeout;
-        EventWaitHandle? live = null;
-
+        var clock = Stopwatch.StartNew();
+        WaitHandle? live = null;
         try
         {
-            while (DateTime.UtcNow < deadline)
+            while (clock.Elapsed < timeout)
             {
                 ct.ThrowIfCancellationRequested();
-
-                if (live is null)
-                {
-                    foreach (string name in candidateNames)
-                    {
-                        if (EventWaitHandle.TryOpenExisting(name, out EventWaitHandle? opened))
-                        {
-                            live = opened;
-                            log?.Invoke($"已打开 {name}。");
-                            break;
-                        }
-                    }
-                }
-
-                if (live is not null && live.WaitOne(TimeSpan.Zero)) return LiveWait.Live;
-
                 if (compositor.HasExited)
                 {
-                    log?.Invoke($"合成器在{purpose}之前退出，退出代码 {compositor.ExitCode}。");
-                    return LiveWait.CompositorExited;
+                    log?.Invoke($"合成器在确认专用化输出之前退出，退出代码 {compositor.ExitCode}。");
+                    return SpecializedWait.CompositorExited;
                 }
-
-                Thread.Sleep(100);
+                live ??= OpenForWait(SpecializedLiveEventName);
+                if (live?.WaitOne(0) == true) return SpecializedWait.Live;
+                ct.WaitHandle.WaitOne(100);
             }
-        }
-        catch (UnauthorizedAccessException)
-        {
-            log?.Invoke($"警告：{candidateNames[0]} 存在但无法打开（DACL）。");
-        }
-        catch (WaitHandleCannotBeOpenedException)
-        {
-            // Never created — falls through to the timeout result.
+            return SpecializedWait.TimedOut;
         }
         finally
         {
             live?.Dispose();
         }
-
-        return LiveWait.TimedOut;
     }
 
     /// <summary>Starts the compositor. Throws <see cref="CompositorNotFoundException"/> if missing.</summary>

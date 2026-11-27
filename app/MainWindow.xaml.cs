@@ -85,14 +85,14 @@ public partial class MainWindow : Window, IHidingUi
         return new CountdownHandle(window);
     }
 
-    public ICountdownHandle ShowApplyCountdown(string summary, int seconds, Action onKeep, Action onRevert)
+    public ICountdownHandle ShowApplyCountdown(string summary, int seconds, MonitorInfo placeOn, Action onKeep, Action onRevert)
     {
         var window = new CountdownWindow(
             seconds,
             heading: "保留这些显示设置？",
             detail: $"已应用：{summary}。" + Environment.NewLine +
-                    "如果看起来有什么不对，或者你看不清楚，请什么都不要做 —— " +
-                    "倒计时归零时，之前的设置会自动恢复。");
+                    "各分区持续出画面 5 秒后会自动保留。画面未就绪会自动还原，也可以立即撤销。",
+            applyCountdown: true);
 
         window.Answered += keep =>
         {
@@ -100,7 +100,7 @@ public partial class MainWindow : Window, IHidingUi
         };
 
         window.Show();
-        window.PlaceOnPrimary();
+        window.PlaceOn(placeOn);
         window.Activate();
         window.Focus();
 

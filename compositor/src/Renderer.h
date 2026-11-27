@@ -83,14 +83,9 @@ private:
     bool CreateDevice();
     bool CreatePipeline();
     void RenderFrame();
-    void DrawQuad(ID3D11ShaderResourceView* srv, float px, float py, float pw, float ph);
+    bool DrawQuad(ID3D11ShaderResourceView* srv, float px, float py, float pw, float ph);
     void ThreadMain();
     void PaceFrame();
-
-    // Records one presented frame for the content-live signal (see
-    // m_contentLiveEvent): only a present that actually showed real captured
-    // frames on every segment counts toward it.
-    void NotePresented(bool hasContent, HRESULT hr);
 
     HWND        m_hwnd = nullptr;
     AppConfig   m_cfg;
@@ -125,14 +120,8 @@ private:
     long long     m_nextPresentQpc = 0;
     HANDLE        m_paceTimer = nullptr;
 
-    // "Content live": signalled once real captured frames have been presented
-    // on every segment for several consecutive frames. Unlike a first Present
-    // (which can be an all-black clear when no capture has delivered yet),
-    // this proves the user can actually see the split content — it is what
-    // the control app's auto-keep waits for.
     HANDLE m_contentLiveEvent = nullptr;
-    bool   m_contentLiveSignalled = false;
-    int    m_contentStreak = 0;
+    uint64_t m_lastSignalledCapture = 0;
 };
 
 } // namespace ds

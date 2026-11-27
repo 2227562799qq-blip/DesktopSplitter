@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Interop;
@@ -19,24 +20,27 @@ public partial class CountdownWindow : Window
     // user never sees the countdown. Re-assert twice as often so it stays on top.
     private readonly DispatcherTimer _topmostTimer;
 
-    private DateTime _deadline;
+    private readonly Stopwatch _clock = Stopwatch.StartNew();
+    private TimeSpan _deadline;
     private bool _answered;
+    private readonly bool _applyCountdown;
 
     // True once the countdown was retargeted at the auto-keep moment (see
     // RetargetForAutoKeep): the number then counts down to "auto-keep".
     private bool _autoKeepPending;
 
-    public CountdownWindow(int timeoutSeconds) : this(timeoutSeconds, null, null) { }
+    public CountdownWindow(int timeoutSeconds) : this(timeoutSeconds, null, null, false) { }
 
-    public CountdownWindow(int timeoutSeconds, string? heading, string? detail)
+    public CountdownWindow(int timeoutSeconds, string? heading, string? detail, bool applyCountdown)
     {
         InitializeComponent();
 
         if (!string.IsNullOrEmpty(heading)) HeadingText.Text = heading;
         if (!string.IsNullOrEmpty(detail)) DetailText.Text = detail;
 
+        _applyCountdown = applyCountdown;
         TimeoutSeconds = Math.Max(1, timeoutSeconds);
-        _deadline = DateTime.UtcNow.AddSeconds(TimeoutSeconds);
+        _deadline = _clock.Elapsed + TimeSpan.FromSeconds(TimeoutSeconds);
 
         _timer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(100) };
         _timer.Tick += (_, _) => UpdateCountdown();
@@ -65,6 +69,7 @@ public partial class CountdownWindow : Window
     {
         _timer.Stop();
         _topmostTimer.Stop();
+        if (!_answered) Answer(false);
         base.OnClosed(e);
     }
 
@@ -95,28 +100,9 @@ public partial class CountdownWindow : Window
     {
         if (_answered) return;
         _autoKeepPending = true;
-        _deadline = DateTime.UtcNow.AddSeconds(Math.Max(1, graceSeconds));
+        _deadline = _clock.Elapsed + TimeSpan.FromSeconds(Math.Max(1, graceSeconds));
         CountdownCaption.Text = "秒后自动保留";
         UpdateCountdown();
-    }
-
-    /// <summary>
-    /// Centres the dialog on whichever display is primary. For a general display change that is
-    /// the right place: it is where the user is looking, and the countdown auto-reverts anyway,
-    /// so it does not need to dodge the affected monitor.
-    /// </summary>
-    public void PlaceOnPrimary()
-    {
-        try
-        {
-            MonitorInfo? primary = DesktopSplitter.Interop.DisplayConfig.Enumerate()
-                .FirstOrDefault(m => m.IsPrimary);
-            if (primary is not null) PlaceOn(primary);
-        }
-        catch
-        {
-            // Leave it wherever WPF put it rather than failing the confirmation.
-        }
     }
 
     /// <summary>
@@ -148,16 +134,26 @@ public partial class CountdownWindow : Window
 
     private void UpdateCountdown()
     {
-        double remaining = (_deadline - DateTime.UtcNow).TotalSeconds;
+        TimeSpan untilDeadline = _deadline - _clock.Elapsed;
+        double remaining = untilDeadline.TotalSeconds;
         if (remaining < 0) remaining = 0;
 
         CountdownText.Text = Math.Ceiling(remaining).ToString("0");
 
         if (remaining <= 0 && !_answered)
         {
+            if (_autoKeepPending)
+            {
+                // Keep the first segment changing until the final captured update arrives.
+                int dots = 1 + (int)(-untilDeadline.TotalMilliseconds / 400) % 3;
+                CountdownText.Text = new string('·', dots);
+                CountdownCaption.Text = "正在确认画面";
+                return;
+            }
+            if (_applyCountdown) return; // The apply worker owns the deadline and both buttons.
             _timer.Stop();
             _topmostTimer.Stop();
-            CountdownCaption.Text = _autoKeepPending ? "正在保留…" : "正在撤销…";
+            CountdownCaption.Text = "正在撤销…";
             KeepButton.IsEnabled = false;
             RevertButton.IsEnabled = false;
         }

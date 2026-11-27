@@ -53,7 +53,7 @@ public interface ISpecializationUi
 /// </summary>
 public interface IApplyConfirmer
 {
-    bool ConfirmApply(string summary, int timeoutSeconds, CancellationToken ct, Process? compositor = null);
+    bool ConfirmApply(string summary, int timeoutSeconds, CancellationToken ct, Process? compositor, MonitorInfo placeOn);
 }
 
 /// <summary>
@@ -187,7 +187,7 @@ public static class ApplyService
 
         // Hand the confirmer the compositor process so it can auto-keep once the
         // compositor proves visible output. A process that is already gone means
-        // no auto-keep is possible; the countdown is user-only.
+        // the change must be rolled back.
         Process? compositor = null;
         try
         {
@@ -195,13 +195,18 @@ public static class ApplyService
         }
         catch (ArgumentException)
         {
-            log.Report($"合成器已退出（pid {applied.CompositorPid}），确认框只等手动操作。");
+            log.Report($"合成器已退出（pid {applied.CompositorPid}），正在恢复之前的设置。");
         }
 
         bool kept;
         try
         {
-            kept = request.Confirmer.ConfirmApply(summary, ConfirmChangesSeconds, ct, compositor);
+            kept = request.Confirmer.ConfirmApply(summary, ConfirmChangesSeconds, ct, compositor, applied.VirtualMonitors[0]);
+        }
+        catch (Exception ex)
+        {
+            log.Report($"无法完成分屏确认，正在恢复之前的设置：{ex.Message}");
+            kept = false;
         }
         finally
         {
@@ -215,7 +220,7 @@ public static class ApplyService
         }
 
         log.Report("更改未确认——正在回滚。");
-        string restored = RollBackTo(snapshot, log, ct, request.SpecializationUi);
+        string restored = RollBackTo(snapshot, log, CancellationToken.None, request.SpecializationUi);
         return new ApplyResult
         {
             VirtualMonitors = applied.VirtualMonitors,

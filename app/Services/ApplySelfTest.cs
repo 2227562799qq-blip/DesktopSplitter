@@ -18,8 +18,7 @@ namespace DesktopSplitter.Services;
 /// fix independently of the repro, and an SDC-fallback phase (see
 /// RunSdcFallbackCheck) proves the SetDisplayConfig fallback arranges a real
 /// split at exactly 60000 mHz. An auto-confirm phase (see RunAutoConfirmCheck)
-/// proves the content-live wait the 0.6.12 auto-keep depends on resolves the
-/// way the confirmer needs.
+/// checks frame-event consumption and the deadlines for keeping and reverting.
 ///
 /// The verdict is the TOPOLOGY plus the apply log, not whether Apply() returned:
 /// a compositor failure after a successful arrange still counts as an arrange
@@ -242,12 +241,7 @@ public static class ApplySelfTest
         }
         log.Report("APPLY-SELF-TEST: fixed virtual refresh ok (165007->60000, 32000->60000).");
 
-        // Auto-confirm mechanism (0.6.12): the content-live wait must resolve
-        // Live when the event is signalled and time out when it is not — this
-        // is the gate auto-keep depends on. Deterministic and display-free:
-        // it signals a synthetic event, never the real compositor. Runs before
-        // the apply below, while no dscomp is running, so the synthetic event
-        // cannot collide with a real one.
+        // Exercise the same wait-only event and confirmation timing used by interactive apply.
         bool autoConfirmPassed = RunAutoConfirmCheck(log);
 
         Exception? applyError = null;
@@ -573,93 +567,42 @@ public static class ApplySelfTest
     /// the 60 Hz mode itself is fine and that the SDC fallback code arranges a
     /// real split end to end.
     /// </summary>
-    /// <summary>
-    /// Auto-confirm mechanism (0.6.12): proves the content-live wait resolves the way the
-    /// confirmer depends on — Live when the event is signalled, TimedOut when it is not, and
-    /// CompositorExited when the compositor dies first. Deterministic and display-free: it
-    /// signals a synthetic event from another thread, never the real compositor. The
-    /// compositor's content-live signal itself is not verified here (CI cannot run the
-    /// compositor's real capture path); that is covered by the log line on a real machine.
-    /// </summary>
+    /// <summary>Checks the same event access and timing rules used by interactive apply.</summary>
     private static bool RunAutoConfirmCheck(Log log)
     {
-        log.Report("AUTO-CONFIRM-TEST: 内容确认等待验证（Live / TimedOut / CompositorExited）。");
-        string name = CompositorLauncher.ContentLiveEventName;
-        EventWaitHandle signal;
-        try
+        string name = CompositorLauncher.ContentLiveEventName(Environment.ProcessId);
+        using var signal = new EventWaitHandle(false, EventResetMode.AutoReset, name, out bool created);
+        using var reader = CompositorLauncher.OpenForWait(name);
+        if (!created || reader is null || reader.WaitOne(0))
         {
-            signal = EventWaitHandle.OpenExisting(name);
-            log.Report("AUTO-CONFIRM-TEST: FAILED — 内容事件已存在且未清理（上一次运行泄漏）。");
+            log.Report("AUTO-CONFIRM-TEST: FAILED — 无法独立创建和读取本次运行的画面事件。");
             return false;
         }
-        catch (WaitHandleCannotBeOpenedException)
+        signal.Set();
+        if (!reader.WaitOne(0) || reader.WaitOne(0))
         {
-            try
-            {
-                signal = new EventWaitHandle(false, EventResetMode.ManualReset, name);
-            }
-            catch (UnauthorizedAccessException)
-            {
-                // No Global privilege here (unelevated session): the wait tries
-                // the session-local namespace second, so verify against that.
-                name = @"Local\DeskSplitContentLive";
-                signal = new EventWaitHandle(false, EventResetMode.ManualReset, name);
-            }
-        }
-        catch (UnauthorizedAccessException)
-        {
-            log.Report("AUTO-CONFIRM-TEST: FAILED — 内容事件存在但无法打开（DACL）。");
+            log.Report("AUTO-CONFIRM-TEST: FAILED — 同一帧只能确认一次。");
             return false;
         }
 
-        try
-        {
-            using Process self = Process.GetCurrentProcess();
-            _ = Task.Run(async () =>
-            {
-                await Task.Delay(300);
-                signal.Set();
-            });
-            var live = CompositorLauncher.WaitForContentLive(
-                self, TimeSpan.FromSeconds(5), CancellationToken.None, log.Report);
-            if (live != CompositorLauncher.ContentLiveWait.Live)
-            {
-                log.Report($"AUTO-CONFIRM-TEST: FAILED — 已发信号的等待应为 Live，实际 {live}。");
-                return false;
-            }
+        var policy = new OutputConfirmation(15);
+        bool passed = policy.Observe(11900, false) == ConfirmationStep.Wait &&
+                      policy.Observe(12000, true) == ConfirmationStep.ShowGrace;
+        policy.StartGrace(12000);
+        for (int now = 13000; now <= 16000; now += 1000)
+            passed &= policy.Observe(now, true) == ConfirmationStep.Wait;
+        passed &= policy.Observe(16999, true) == ConfirmationStep.Wait &&
+                  policy.Observe(17000, false) == ConfirmationStep.Wait &&
+                  policy.Observe(17100, true) == ConfirmationStep.Keep;
 
-            signal.Reset();
-            var timedOut = CompositorLauncher.WaitForContentLive(
-                self, TimeSpan.FromSeconds(1), CancellationToken.None, log.Report);
-            if (timedOut != CompositorLauncher.ContentLiveWait.TimedOut)
-            {
-                log.Report($"AUTO-CONFIRM-TEST: FAILED — 未发信号的等待应为 TimedOut，实际 {timedOut}。");
-                return false;
-            }
-
-            using Process exited = Process.Start(new ProcessStartInfo
-            {
-                FileName = "cmd.exe",
-                Arguments = "/c exit 0",
-                UseShellExecute = false,
-                CreateNoWindow = true,
-            })!;
-            exited.WaitForExit();
-            var dead = CompositorLauncher.WaitForContentLive(
-                exited, TimeSpan.FromSeconds(5), CancellationToken.None, log.Report);
-            if (dead != CompositorLauncher.ContentLiveWait.CompositorExited)
-            {
-                log.Report($"AUTO-CONFIRM-TEST: FAILED — 已退出进程的等待应为 CompositorExited，实际 {dead}。");
-                return false;
-            }
-
-            log.Report("AUTO-CONFIRM-TEST: PASSED — Live / TimedOut / CompositorExited 均正确。");
-            return true;
-        }
-        finally
-        {
-            signal.Dispose();
-        }
+        var stalled = new OutputConfirmation(15);
+        stalled.StartGrace(200);
+        passed &= stalled.Observe(2800, true) == ConfirmationStep.OutputStopped &&
+                  new OutputConfirmation(15).Observe(15000, false) == ConfirmationStep.NoOutput;
+        log.Report(passed
+            ? "AUTO-CONFIRM-TEST: PASSED — 事件消费、延迟出画面、完整五秒、停帧与超时。"
+            : "AUTO-CONFIRM-TEST: FAILED — 保留或撤销时间不正确。");
+        return passed;
     }
 
     private static bool RunSdcFallbackCheck(Log log, ApplyRequest request, int halfW, int height)

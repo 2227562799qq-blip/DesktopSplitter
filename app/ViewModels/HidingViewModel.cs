@@ -36,7 +36,7 @@ public interface IHidingUi
     /// <summary>
     /// Shows the generic "Keep these display settings?" countdown, centred on the primary display.
     /// </summary>
-    ICountdownHandle ShowApplyCountdown(string summary, int seconds, Action onKeep, Action onRevert);
+    ICountdownHandle ShowApplyCountdown(string summary, int seconds, MonitorInfo placeOn, Action onKeep, Action onRevert);
 
     /// <summary>
     /// Shows the guided "Remove display from desktop" instructions on <paramref name="placeOn"/>.

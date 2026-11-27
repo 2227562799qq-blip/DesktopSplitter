@@ -184,6 +184,10 @@ void SegmentCapture::TeardownDuplication() {
         m_dupl->ReleaseFrame();
         m_holdingFrame = false;
     }
+    if (m_dupl && m_shared) {
+        std::lock_guard<std::mutex> lock(m_shared->mtx);
+        m_shared->hasFrame = false;
+    }
     m_dupl.Reset();
     m_staging.Reset();
     m_stagingW = m_stagingH = 0;
@@ -357,8 +361,8 @@ bool SegmentCapture::PublishFrame(ID3D11Texture2D* acquired) {
     {
         std::lock_guard<std::mutex> lock(m_shared->mtx);
         m_shared->hasFrame = true;
+        m_shared->framesCaptured.fetch_add(1, std::memory_order_relaxed);
     }
-    m_shared->framesCaptured.fetch_add(1, std::memory_order_relaxed);
     return true;
 }
 
