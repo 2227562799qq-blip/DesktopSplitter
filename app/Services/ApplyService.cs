@@ -45,10 +45,15 @@ public interface ISpecializationUi
 /// change. Called from a BACKGROUND thread and blocks; returns true to keep.
 /// MUST resolve to false when the countdown lapses — that timeout is the safety net for a change
 /// that left the user unable to see or click anything.
+/// When <paramref name="compositor"/> is supplied, the countdown ALSO resolves true once the
+/// compositor proves visible output (real captured frames presented on every segment) and a
+/// short grace period passes without the user vetoing — the user never has to hunt for the
+/// dialog. A compositor that never proves visible output never auto-keeps: the lapse still
+/// resolves false, exactly as before.
 /// </summary>
 public interface IApplyConfirmer
 {
-    bool ConfirmApply(string summary, int timeoutSeconds, CancellationToken ct);
+    bool ConfirmApply(string summary, int timeoutSeconds, CancellationToken ct, Process? compositor = null);
 }
 
 /// <summary>
@@ -180,7 +185,30 @@ public static class ApplyService
         string summary = $"在 {request.Physical.DisplayLabel} 上应用{request.Layout.Name}" +
                          $"（{string.Join(", ", request.Resolutions.Select(r => $"{r.Width}x{r.Height}"))}）";
 
-        if (request.Confirmer.ConfirmApply(summary, ConfirmChangesSeconds, ct))
+        // Hand the confirmer the compositor process so it can auto-keep once the
+        // compositor proves visible output. A process that is already gone means
+        // no auto-keep is possible; the countdown is user-only.
+        Process? compositor = null;
+        try
+        {
+            compositor = Process.GetProcessById(applied.CompositorPid);
+        }
+        catch (ArgumentException)
+        {
+            log.Report($"合成器已退出（pid {applied.CompositorPid}），确认框只等手动操作。");
+        }
+
+        bool kept;
+        try
+        {
+            kept = request.Confirmer.ConfirmApply(summary, ConfirmChangesSeconds, ct, compositor);
+        }
+        finally
+        {
+            compositor?.Dispose();
+        }
+
+        if (kept)
         {
             log.Report("已保留更改。");
             return applied;

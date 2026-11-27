@@ -11,6 +11,9 @@ namespace DesktopSplitter.ViewModels;
 public interface ICountdownHandle
 {
     void CloseFromHelper();
+
+    /// <summary>Retargets the countdown at the auto-keep moment (see CountdownWindow).</summary>
+    void NoteAutoKeep(int graceSeconds);
 }
 
 /// <summary>A live guided-Settings dialog the caller can dismiss early.</summary>

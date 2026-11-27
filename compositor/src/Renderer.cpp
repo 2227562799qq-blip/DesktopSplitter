@@ -5,6 +5,7 @@
 
 #include <d3d11_4.h>
 #include <d3dcompiler.h>
+#include <sddl.h>
 #include <algorithm>
 #include <cmath>
 
@@ -89,6 +90,67 @@ bool PickAdapter(IDXGIFactory5* factory, const std::wstring& deviceName,
 }
 
 } // namespace
+
+// Signalled once real captured frames have been presented on every segment
+// for several consecutive frames. The control app treats "signalled within
+// the confirm window" as proof the user can actually see the split content,
+// and auto-keeps the change. This is deliberately stricter than a first
+// Present: RenderFrame clears to black and presents unconditionally, so a
+// first Present can be an all-black frame when no capture has delivered yet.
+const wchar_t* const kContentLiveEventName = L"DeskSplitContentLive";
+
+// Authenticated Users get SYNCHRONIZE only: the app waits on this, it never
+// sets it. Admins/SYSTEM keep full control.
+const wchar_t* const kContentLiveEventSddl =
+    L"D:P(A;;0x1f0003;;;BA)(A;;0x1f0003;;;SY)(A;;0x00100000;;;AU)";
+
+// Consecutive presented frames with real content on every segment before the
+// content-live event fires. One frame is not enough: the first duplicated
+// frame from a freshly arrived virtual display can be transiently black.
+constexpr int kContentLiveFrames = 3;
+
+// Creates the content-live event, preferring the Global namespace. An
+// unelevated dscomp has no SeCreateGlobalPrivilege, so fall back to the
+// session-local namespace rather than running without a signal - and say
+// which was used.
+HANDLE CreateContentLiveEvent() {
+    PSECURITY_DESCRIPTOR sd = nullptr;
+    if (!::ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            kContentLiveEventSddl, SDDL_REVISION_1, &sd, nullptr)) {
+        DS_WARN(L"content live: could not build the event DACL (0x%08X)",
+                ::GetLastError());
+        return nullptr;
+    }
+    SECURITY_ATTRIBUTES sa = {};
+    sa.nLength = sizeof(sa);
+    sa.lpSecurityDescriptor = sd;
+
+    std::wstring full = std::wstring(L"Global\\") + kContentLiveEventName;
+    HANDLE h = ::CreateEventW(&sa, TRUE, FALSE, full.c_str());
+    if (!h && ::GetLastError() == ERROR_ACCESS_DENIED) {
+        // Either no Global privilege, or the object exists and CreateEvent's
+        // implicit EVENT_ALL_ACCESS request was refused. Try to open it with
+        // just what we need before changing namespace.
+        h = ::OpenEventW(EVENT_MODIFY_STATE | SYNCHRONIZE, FALSE, full.c_str());
+        if (!h) {
+            full = std::wstring(L"Local\\") + kContentLiveEventName;
+            h = ::CreateEventW(&sa, TRUE, FALSE, full.c_str());
+        }
+    }
+    ::LocalFree(sd);
+
+    if (h) {
+        // Fresh per compositor run: a stale signal from a previous run must not
+        // be mistaken for this one succeeding.
+        ::ResetEvent(h);
+        DS_LOG(L"content live: event ready: %s", full.c_str());
+    } else {
+        DS_WARN(L"content live: could not create the event (0x%08X) - the "
+                L"control app will not see a content-live signal",
+                ::GetLastError());
+    }
+    return h;
+}
 
 Renderer::~Renderer() {
     StopThread();
@@ -347,6 +409,24 @@ std::atomic<long long> g_diagLockTicks{0};      // of which: waiting for m_gpu.m
 std::atomic<long>      g_diagPresentHr{0};      // last Present HRESULT (occlusion shows here)
 }
 
+void Renderer::NotePresented(bool hasContent, HRESULT hr) {
+    // Only a present that actually reached the display (S_OK — an occluded
+    // present reports DXGI_STATUS_OCCLUDED instead) and showed real content
+    // counts. Anything else breaks the streak.
+    if (hr != S_OK || !hasContent) {
+        m_contentStreak = 0;
+        return;
+    }
+    if (m_contentLiveSignalled) return;
+    if (++m_contentStreak < kContentLiveFrames) return;
+    m_contentLiveSignalled = true;
+    if (m_contentLiveEvent) {
+        ::SetEvent(m_contentLiveEvent);
+        DS_LOG(L"content live: all %zu segments presenting captured frames - signalled %s",
+               m_cfg.segments.size(), kContentLiveEventName);
+    }
+}
+
 void Renderer::RenderFrame() {
     if (!m_presenter) return;
     ID3D11RenderTargetView* rtv = m_presenter->BeginFrame();
@@ -374,6 +454,8 @@ void Renderer::RenderFrame() {
         }
         const HRESULT thr = m_presenter->EndFrame();
         g_diagPresentHr.store(static_cast<long>(thr), std::memory_order_relaxed);
+        // The cycling colour IS the visible content in this mode.
+        NotePresented(true, thr);
         if (FAILED(thr)) {
             const HRESULT reason = m_gpu.device->GetDeviceRemovedReason();
             DS_ERR(L"test-pattern present failed: 0x%08X (our device: %s)",
@@ -551,6 +633,19 @@ void Renderer::RenderFrame() {
     ::QueryPerformanceCounter(&pt1);
     g_diagPresentTicks.fetch_add(pt1.QuadPart - pt0.QuadPart, std::memory_order_relaxed);
     g_diagPresentHr.store(static_cast<long>(hr), std::memory_order_relaxed);
+    {
+        // Content means every segment is showing a real captured frame — the
+        // same condition the draw loop above uses. A segment whose capture
+        // never delivered stays black, so it must block the signal.
+        bool allContent = !snaps.empty();
+        for (const Snapshot& snap : snaps) {
+            if (!snap.hasFrame || !snap.srv || snap.frameW == 0 || snap.frameH == 0) {
+                allContent = false;
+                break;
+            }
+        }
+        NotePresented(allContent, hr);
+    }
     if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) {
         // Do not blame our D3D device without checking it. A specialized
         // presenter reports the DISPLAY stack's errors through the same
@@ -682,6 +777,12 @@ void Renderer::ThreadMain() {
 }
 
 bool Renderer::StartThread() {
+    // Created here, before the render thread can present anything, so a
+    // stale signal from a previous run is reset before any frame is counted.
+    // A null handle only disables the signal; presenting continues regardless.
+    m_contentLiveEvent = CreateContentLiveEvent();
+    m_contentLiveSignalled = false;
+    m_contentStreak = 0;
     m_stop.store(false, std::memory_order_release);
     m_thread = std::thread([this] { ThreadMain(); });
     return true;
@@ -722,6 +823,10 @@ void Renderer::Shutdown() {
     if (m_paceTimer) {
         ::CloseHandle(m_paceTimer);
         m_paceTimer = nullptr;
+    }
+    if (m_contentLiveEvent) {
+        ::CloseHandle(m_contentLiveEvent);
+        m_contentLiveEvent = nullptr;
     }
 }
 

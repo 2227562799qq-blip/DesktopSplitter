@@ -114,6 +114,8 @@ public partial class MainWindow : Window, IHidingUi
         public CountdownHandle(CountdownWindow window) => _window = window;
 
         public void CloseFromHelper() => _window.CloseFromHelper();
+
+        public void NoteAutoKeep(int graceSeconds) => _window.RetargetForAutoKeep(graceSeconds);
     }
 
     public IGuidedHandle ShowGuidedSettings(

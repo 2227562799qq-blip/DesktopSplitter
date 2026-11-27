@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.IO;
 using DesktopSplitter.Interop;
 using DesktopSplitter.Models;
@@ -16,12 +17,14 @@ namespace DesktopSplitter.Services;
 /// topology failure reproduces, a rotation phase validates the generation-rotation
 /// fix independently of the repro, and an SDC-fallback phase (see
 /// RunSdcFallbackCheck) proves the SetDisplayConfig fallback arranges a real
-/// split at exactly 60000 mHz.
+/// split at exactly 60000 mHz. An auto-confirm phase (see RunAutoConfirmCheck)
+/// proves the content-live wait the 0.6.12 auto-keep depends on resolves the
+/// way the confirmer needs.
 ///
 /// The verdict is the TOPOLOGY plus the apply log, not whether Apply() returned:
 /// a compositor failure after a successful arrange still counts as an arrange
 /// pass (reported separately as a warning), because the arrange is what this
-/// test gates. Exit codes: 0 = arrange + rotation + SDC-fallback + revert
+/// test gates. Exit codes: 0 = arrange + rotation + SDC-fallback + auto-confirm + revert
 /// passed; 1 = failed; 2 = skipped (no physical display mode big enough for
 /// a 2-way split). The inactive-repro result is reported in the RESULT line
 /// but is NOT part of the exit gate: round 4 proved the cloud cannot reproduce
@@ -239,6 +242,14 @@ public static class ApplySelfTest
         }
         log.Report("APPLY-SELF-TEST: fixed virtual refresh ok (165007->60000, 32000->60000).");
 
+        // Auto-confirm mechanism (0.6.12): the content-live wait must resolve
+        // Live when the event is signalled and time out when it is not — this
+        // is the gate auto-keep depends on. Deterministic and display-free:
+        // it signals a synthetic event, never the real compositor. Runs before
+        // the apply below, while no dscomp is running, so the synthetic event
+        // cannot collide with a real one.
+        bool autoConfirmPassed = RunAutoConfirmCheck(log);
+
         Exception? applyError = null;
         ApplyResult? result = null;
         try
@@ -312,12 +323,13 @@ public static class ApplySelfTest
                    $"inactive-repro={(reproPassed ? "PASS" : "FAIL")} " +
                    $"rotation={(rotationPassed ? "PASS" : "FAIL")} " +
                    $"sdc-fallback={(sdcFallbackPassed ? "PASS" : "FAIL")} " +
+                   $"auto-confirm={(autoConfirmPassed ? "PASS" : "FAIL")} " +
                    $"revert={(revertPassed ? "PASS" : "FAIL")}");
         // inactive-repro is reported above but deliberately not gated: the
         // cloud cannot reproduce lu's failure (see the class comment), so it
         // can never pass here. The gate is everything that CAN be verified
-        // in the cloud: arrange + rotation + SDC fallback + revert.
-        return arrangePassed && rotationPassed && sdcFallbackPassed && revertPassed ? 0 : 1;
+        // in the cloud: arrange + rotation + SDC fallback + auto-confirm + revert.
+        return arrangePassed && rotationPassed && sdcFallbackPassed && autoConfirmPassed && revertPassed ? 0 : 1;
     }
 
     /// <summary>Verifies the live topology after a successful Apply().</summary>
@@ -561,6 +573,95 @@ public static class ApplySelfTest
     /// the 60 Hz mode itself is fine and that the SDC fallback code arranges a
     /// real split end to end.
     /// </summary>
+    /// <summary>
+    /// Auto-confirm mechanism (0.6.12): proves the content-live wait resolves the way the
+    /// confirmer depends on — Live when the event is signalled, TimedOut when it is not, and
+    /// CompositorExited when the compositor dies first. Deterministic and display-free: it
+    /// signals a synthetic event from another thread, never the real compositor. The
+    /// compositor's content-live signal itself is not verified here (CI cannot run the
+    /// compositor's real capture path); that is covered by the log line on a real machine.
+    /// </summary>
+    private static bool RunAutoConfirmCheck(Log log)
+    {
+        log.Report("AUTO-CONFIRM-TEST: 内容确认等待验证（Live / TimedOut / CompositorExited）。");
+        string name = CompositorLauncher.ContentLiveEventName;
+        EventWaitHandle signal;
+        try
+        {
+            signal = EventWaitHandle.OpenExisting(name);
+            log.Report("AUTO-CONFIRM-TEST: FAILED — 内容事件已存在且未清理（上一次运行泄漏）。");
+            return false;
+        }
+        catch (WaitHandleCannotBeOpenedException)
+        {
+            try
+            {
+                signal = new EventWaitHandle(false, EventResetMode.ManualReset, name);
+            }
+            catch (UnauthorizedAccessException)
+            {
+                // No Global privilege here (unelevated session): the wait tries
+                // the session-local namespace second, so verify against that.
+                name = @"Local\DeskSplitContentLive";
+                signal = new EventWaitHandle(false, EventResetMode.ManualReset, name);
+            }
+        }
+        catch (UnauthorizedAccessException)
+        {
+            log.Report("AUTO-CONFIRM-TEST: FAILED — 内容事件存在但无法打开（DACL）。");
+            return false;
+        }
+
+        try
+        {
+            using Process self = Process.GetCurrentProcess();
+            _ = Task.Run(async () =>
+            {
+                await Task.Delay(300);
+                signal.Set();
+            });
+            var live = CompositorLauncher.WaitForContentLive(
+                self, TimeSpan.FromSeconds(5), CancellationToken.None, log.Report);
+            if (live != CompositorLauncher.ContentLiveWait.Live)
+            {
+                log.Report($"AUTO-CONFIRM-TEST: FAILED — 已发信号的等待应为 Live，实际 {live}。");
+                return false;
+            }
+
+            signal.Reset();
+            var timedOut = CompositorLauncher.WaitForContentLive(
+                self, TimeSpan.FromSeconds(1), CancellationToken.None, log.Report);
+            if (timedOut != CompositorLauncher.ContentLiveWait.TimedOut)
+            {
+                log.Report($"AUTO-CONFIRM-TEST: FAILED — 未发信号的等待应为 TimedOut，实际 {timedOut}。");
+                return false;
+            }
+
+            using Process exited = Process.Start(new ProcessStartInfo
+            {
+                FileName = "cmd.exe",
+                Arguments = "/c exit 0",
+                UseShellExecute = false,
+                CreateNoWindow = true,
+            })!;
+            exited.WaitForExit();
+            var dead = CompositorLauncher.WaitForContentLive(
+                exited, TimeSpan.FromSeconds(5), CancellationToken.None, log.Report);
+            if (dead != CompositorLauncher.ContentLiveWait.CompositorExited)
+            {
+                log.Report($"AUTO-CONFIRM-TEST: FAILED — 已退出进程的等待应为 CompositorExited，实际 {dead}。");
+                return false;
+            }
+
+            log.Report("AUTO-CONFIRM-TEST: PASSED — Live / TimedOut / CompositorExited 均正确。");
+            return true;
+        }
+        finally
+        {
+            signal.Dispose();
+        }
+    }
+
     private static bool RunSdcFallbackCheck(Log log, ApplyRequest request, int halfW, int height)
     {
         log.Report("SDC-FALLBACK-TEST: 强制 60000 mHz 创建 + SetDisplayConfig 兜底排列验证。");

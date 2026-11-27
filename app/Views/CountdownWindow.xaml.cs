@@ -13,8 +13,18 @@ namespace DesktopSplitter.Views;
 public partial class CountdownWindow : Window
 {
     private readonly DispatcherTimer _timer;
+
+    // The compositor's fullscreen window re-asserts itself topmost every couple
+    // of seconds; without our own re-assert this dialog sinks behind it and the
+    // user never sees the countdown. Re-assert twice as often so it stays on top.
+    private readonly DispatcherTimer _topmostTimer;
+
     private DateTime _deadline;
     private bool _answered;
+
+    // True once the countdown was retargeted at the auto-keep moment (see
+    // RetargetForAutoKeep): the number then counts down to "auto-keep".
+    private bool _autoKeepPending;
 
     public CountdownWindow(int timeoutSeconds) : this(timeoutSeconds, null, null) { }
 
@@ -30,6 +40,8 @@ public partial class CountdownWindow : Window
 
         _timer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(100) };
         _timer.Tick += (_, _) => UpdateCountdown();
+        _topmostTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(500) };
+        _topmostTimer.Tick += (_, _) => ReassertTopmost();
         UpdateCountdown();
     }
 
@@ -45,7 +57,47 @@ public partial class CountdownWindow : Window
     {
         base.OnSourceInitialized(e);
         _timer.Start();
+        _topmostTimer.Start();
         Activate();
+    }
+
+    protected override void OnClosed(EventArgs e)
+    {
+        _timer.Stop();
+        _topmostTimer.Stop();
+        base.OnClosed(e);
+    }
+
+    /// <summary>Keeps this dialog above the compositor's fullscreen topmost window.</summary>
+    private void ReassertTopmost()
+    {
+        if (_answered) return;
+        try
+        {
+            var helper = new WindowInteropHelper(this);
+            IntPtr hwnd = helper.Handle;
+            if (hwnd == IntPtr.Zero) return;
+            SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        }
+        catch
+        {
+            // Best effort: the next tick retries.
+        }
+    }
+
+    /// <summary>
+    /// Retargets the countdown at the auto-keep moment: the number now counts down to
+    /// "auto-keep" instead of "auto-revert", and the caption says so. The user can still
+    /// press Revert during the grace period.
+    /// </summary>
+    public void RetargetForAutoKeep(int graceSeconds)
+    {
+        if (_answered) return;
+        _autoKeepPending = true;
+        _deadline = DateTime.UtcNow.AddSeconds(Math.Max(1, graceSeconds));
+        CountdownCaption.Text = "秒后自动保留";
+        UpdateCountdown();
     }
 
     /// <summary>
@@ -104,7 +156,8 @@ public partial class CountdownWindow : Window
         if (remaining <= 0 && !_answered)
         {
             _timer.Stop();
-            CountdownCaption.Text = "正在撤销…";
+            _topmostTimer.Stop();
+            CountdownCaption.Text = _autoKeepPending ? "正在保留…" : "正在撤销…";
             KeepButton.IsEnabled = false;
             RevertButton.IsEnabled = false;
         }
@@ -114,6 +167,7 @@ public partial class CountdownWindow : Window
     public void CloseFromHelper()
     {
         _timer.Stop();
+        _topmostTimer.Stop();
         _answered = true;
         try { Close(); } catch (InvalidOperationException) { /* already closing */ }
     }
@@ -127,6 +181,7 @@ public partial class CountdownWindow : Window
         if (_answered) return;
         _answered = true;
         _timer.Stop();
+        _topmostTimer.Stop();
         Decision = keep;
 
         KeepButton.IsEnabled = false;
@@ -139,6 +194,8 @@ public partial class CountdownWindow : Window
     // ------------------------------------------------------------------ P/Invoke
 
     private static readonly IntPtr HWND_TOPMOST = new(-1);
+    private const uint SWP_NOSIZE = 0x0001;
+    private const uint SWP_NOMOVE = 0x0002;
     private const uint SWP_NOACTIVATE = 0x0010;
     private const uint SWP_SHOWWINDOW = 0x0040;
 
