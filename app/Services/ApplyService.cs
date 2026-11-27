@@ -219,6 +219,7 @@ public static class ApplyService
             return applied;
         }
 
+        CompositorLauncher.ReportStartupLog(log);
         log.Report("更改未确认——正在回滚。");
         string restored = RollBackTo(snapshot, log, CancellationToken.None, request.SpecializationUi);
         return new ApplyResult

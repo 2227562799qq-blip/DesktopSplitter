@@ -11,6 +11,7 @@
 namespace ds {
 
 struct MonitorEntry {
+    HMONITOR     handle = nullptr;
     std::wstring device;        // MONITORINFOEX.szDevice, e.g. "\\.\DISPLAY1"
     RECT         rect = {};     // full monitor rect, virtual-desktop coords
     RECT         work = {};     // work area (minus taskbar / appbars)
@@ -26,6 +27,7 @@ size_t EnumerateMonitors(std::vector<MonitorEntry>& out);
 // Finds the monitor whose GDI device name (MONITORINFOEX.szDevice, e.g.
 // "\\.\DISPLAY1") matches 'deviceName' and returns its desktop rect.
 bool FindMonitorRect(const std::wstring& deviceName, RECT& rect);
+HMONITOR FindMonitorHandle(const std::wstring& deviceName);
 
 // Same, but returns the work area instead of the full monitor rect.
 bool FindMonitorWorkArea(const std::wstring& deviceName, RECT& work);

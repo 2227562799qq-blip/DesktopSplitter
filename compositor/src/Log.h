@@ -5,7 +5,8 @@
 
 namespace ds {
 
-void LogInit(bool verbose);
+void LogInit(bool verbose, const std::wstring& path);
+void LogClose();
 bool LogIsVerbose();
 void LogWrite(const wchar_t* level, const wchar_t* fmt, ...);
 

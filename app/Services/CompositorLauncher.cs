@@ -19,6 +19,24 @@ public static class CompositorLauncher
 {
     public const string ExecutableName = "dscomp.exe";
 
+    private static string LogPath => Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "DesktopSplitter", "compositor.log");
+
+    internal static void ReportStartupLog(IProgress<string> log)
+    {
+        try
+        {
+            using var stream = new FileStream(LogPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            using var reader = new StreamReader(stream);
+            log.Report($"合成器启动日志：{LogPath}");
+            foreach (string line in reader.ReadToEnd().Split('\n', StringSplitOptions.RemoveEmptyEntries).TakeLast(24))
+                log.Report($"  dscomp {line.TrimEnd('\r')}");
+        }
+        catch (IOException) { }
+        catch (UnauthorizedAccessException) { }
+    }
+
     /// <summary>DESKSPLIT_COMPOSITOR_STOP_EVENT</summary>
     public const string StopEventName = @"Global\DeskSplitCompositorStop";
 
@@ -212,6 +230,14 @@ public static class CompositorLauncher
             CreateNoWindow = true,
         };
         foreach (string argument in arguments) psi.ArgumentList.Add(argument);
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(LogPath)!);
+            psi.ArgumentList.Add("--log-file");
+            psi.ArgumentList.Add(LogPath);
+        }
+        catch (IOException) { }
+        catch (UnauthorizedAccessException) { }
 
         Process? p = Process.Start(psi);
         if (p is null)

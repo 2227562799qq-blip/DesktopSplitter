@@ -47,6 +47,7 @@ struct Options {
     uint32_t     modeHeight = 0;
     double       modeHz = 0.0;
     std::wstring configPath;
+    std::wstring logPath;
 };
 
 // The GUI installer writes HKLM\SOFTWARE\DesktopSplitter\HidePhysicalDisplay=1
@@ -77,6 +78,7 @@ struct App {
     CursorConfiner                               confiner;
     SessionWatcher                               session;
     bool                                         specialized = false;
+    bool                                         windowReady = false;
     WindowRescuer                                rescuer;
 
     HANDLE      stopEvent = nullptr;      // DESKSPLIT_COMPOSITOR_STOP_EVENT
@@ -104,14 +106,14 @@ void ApplyWindowPlacement(App& app) {
     const int w = app.physicalRect.right - app.physicalRect.left;
     const int h = app.physicalRect.bottom - app.physicalRect.top;
     ::SetWindowPos(app.hwnd, HWND_TOPMOST, x, y, w, h,
-                   SWP_NOACTIVATE | SWP_SHOWWINDOW);
+                   SWP_NOACTIVATE);
 }
 
 void OnDisplayChange(App& app) {
     RECT r = {};
     if (FindMonitorRect(app.config.physicalDevice, r)) {
         app.physicalRect = r;
-        ApplyWindowPlacement(app);
+        if (!app.specialized) ApplyWindowPlacement(app);
         const UINT w = static_cast<UINT>(r.right - r.left);
         const UINT h = static_cast<UINT>(r.bottom - r.top);
         app.renderer.RequestResize(w, h);
@@ -123,8 +125,8 @@ void OnDisplayChange(App& app) {
     }
     // Making a virtual monitor primary re-bases virtual-desktop coordinates, so
     // every cached rect (including negative-coordinate ones) has to be redone.
-    if (app.opt.confine) app.confiner.Refresh();
-    if (app.opt.rescue) app.rescuer.OnDisplayChange();
+    if (app.windowReady && app.opt.confine) app.confiner.Refresh();
+    if (app.windowReady && app.opt.rescue) app.rescuer.OnDisplayChange();
 }
 
 // Hide the compositor so the physical monitor shows whatever Windows is
@@ -139,11 +141,9 @@ void OnSuspendStateChanged(void* context, bool suspended, SuspendReason why) {
         if (!app->specialized) ::ShowWindow(app->hwnd, SW_HIDE);
         DS_LOG(L"suspend: compositor hidden, cursor clip released (%s)",
                SuspendReasonName(why));
-    } else {
-        if (!app->specialized) {
-            ::ShowWindow(app->hwnd, SW_SHOWNOACTIVATE);
-            ApplyWindowPlacement(*app);
-        }
+    } else if (app->windowReady) {
+        ApplyWindowPlacement(*app);
+        ::ShowWindow(app->hwnd, SW_SHOWNOACTIVATE);
         if (app->opt.confine) {
             app->confiner.Configure(app->config.physicalDevice);
             app->confiner.InstallHook();
@@ -177,12 +177,21 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if (app) OnDisplayChange(*app);
         return 0;
 
+    case kCompositorReadyMessage:
+        if (!app || app->windowReady) return 0;
+        app->windowReady = true;
+        DS_LOG(L"all segments drawn; the compositor window is ready");
+        if (!app->session.IsSuspended()) OnSuspendStateChanged(app, false, SuspendReason::None);
+        if (app->opt.rescue) app->rescuer.Start(app->config.physicalDevice,
+                                               app->config.segments[0].virtualDevice);
+        return 0;
+
     case WM_TIMER:
         if (wParam == kTimerId && app) {
             // Backstop for EVENT_SYSTEM_DESKTOPSWITCH, which is not fully
             // reliable; this catches anything the hook missed.
             app->session.PollInputDesktop();
-            if (app->session.IsSuspended()) return 0;   // stay out of the way
+            if (app->session.IsSuspended() || !app->windowReady) return 0;
             if (app->opt.confine) app->confiner.Reapply();
             ::SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
                            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
@@ -251,9 +260,7 @@ bool CreateCompositorWindow(App& app, HINSTANCE hinst, bool messageOnly) {
         return false;
     }
 
-    ::ShowWindow(app.hwnd, SW_SHOWNOACTIVATE);
-    ApplyWindowPlacement(app);
-    DS_LOG(L"window created at (%d,%d) %dx%d", x, y, w, h);
+    DS_LOG(L"hidden window created at (%d,%d) %dx%d; waiting for captured frames", x, y, w, h);
     return true;
 }
 
@@ -309,6 +316,7 @@ void PrintUsage() {
                L"\n"
                L"  --verbose, -v    Verbose logging to stderr / OutputDebugString.\n"
                L"  --config <path>  Override %%ProgramData%%\\DesktopSplitter\\config.json.\n"
+               L"  --log-file <path> Write a bounded UTF-8 startup log.\n"
                L"  --no-confine     Do not keep the cursor off the covered monitor.\n"
                L"  --no-rescue      Do not relocate windows that open behind the\n"
                L"                   compositor onto the first virtual monitor.\n"
@@ -345,8 +353,8 @@ void PrintUsage() {
 }
 
 int Run(HINSTANCE hinst, const Options& opt) {
-    LogInit(opt.verbose);
-    DS_LOG(L"dscomp " DS_VERSION_WSTR L" starting");
+    LogInit(opt.verbose, opt.logPath);
+    DS_LOG(L"dscomp " DS_VERSION_WSTR L" starting (pid %lu)", ::GetCurrentProcessId());
 
     App app;
     app.opt = opt;
@@ -420,25 +428,6 @@ int Run(HINSTANCE hinst, const Options& opt) {
     if (specializedActive) {
         DS_LOG(L"specialized presentation active: skipping cursor confinement "
                L"and the window rescuer (the display is out of the desktop)");
-    }
-
-    if (app.opt.confine && !specializedActive) {
-        app.confiner.Configure(app.config.physicalDevice);
-        if (!app.confiner.InstallHook()) {
-            // Exclusion is hook-only, so no hook means no confinement. Carry on
-            // rather than degrading cursor movement with a bad ClipCursor.
-            DS_WARN(L"running without cursor confinement");
-        }
-    } else if (!specializedActive) {
-        DS_LOG(L"cursor confinement disabled (--no-confine)");
-    }
-
-    if (app.opt.rescue && !specializedActive) {
-        // Segment 1 is the relocation target: config segments[0].
-        app.rescuer.Start(app.config.physicalDevice,
-                          app.config.segments[0].virtualDevice);
-    } else if (!specializedActive) {
-        DS_LOG(L"window rescuer disabled (--no-rescue)");
     }
 
     app.renderer.SetTestPattern(opt.testPattern);
@@ -516,6 +505,8 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPWSTR,
                 opt.verbose = true;
             } else if ((a == L"--config" || a == L"-c") && i + 1 < argc) {
                 opt.configPath = argv[++i];
+            } else if (a == L"--log-file" && i + 1 < argc) {
+                opt.logPath = argv[++i];
             } else if (a == L"--no-confine") {
                 opt.confine = false;
             } else if (a == L"--no-rescue") {
@@ -558,6 +549,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPWSTR,
     }
 
     const int rc = ds::Run(hInstance, opt);
+    ds::LogClose();
     ::SetConsoleCtrlHandler(ds::ConsoleCtrlHandler, FALSE);
     return rc;
 }

@@ -1,7 +1,18 @@
 #include "Capture.h"
 #include "Log.h"
+#include "MonitorUtil.h"
 
 #include <d3d11.h>
+#include <memory>
+#include <roapi.h>
+
+#pragma warning(push, 0)
+#include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.Graphics.Capture.h>
+#include <winrt/Windows.Graphics.DirectX.Direct3D11.h>
+#include <windows.graphics.capture.interop.h>
+#include <windows.graphics.directx.direct3d11.interop.h>
+#pragma warning(pop)
 
 using Microsoft::WRL::ComPtr;
 
@@ -26,6 +37,7 @@ namespace {
 constexpr UINT kAcquireTimeoutMs = 0;
 constexpr DWORD kIdlePollMs = 1;
 constexpr DWORD kRetryDelayMs = 250;
+constexpr ULONGLONG kFirstFrameDeadlineMs = 2000;
 
 // Converts a DXGI pointer shape to tightly packed BGRA. Returns false when the
 // shape type is unknown or the buffer is too small.
@@ -366,6 +378,89 @@ bool SegmentCapture::PublishFrame(ID3D11Texture2D* acquired) {
     return true;
 }
 
+void SegmentCapture::TryGraphicsCapture() {
+    namespace capture = winrt::Windows::Graphics::Capture;
+    namespace directx = winrt::Windows::Graphics::DirectX;
+    using ::Windows::Graphics::DirectX::Direct3D11::IDirect3DDxgiInterfaceAccess;
+
+    DS_LOG(L"segment %zu: no DXGI frame from '%s'; trying Windows Graphics Capture",
+           m_index, m_cfg.virtualDevice.c_str());
+    const HMONITOR monitor = FindMonitorHandle(m_cfg.virtualDevice);
+    if (!monitor) {
+        DS_WARN(L"segment %zu: '%s' is not attached to the desktop",
+                m_index, m_cfg.virtualDevice.c_str());
+        return;
+    }
+
+    // WGC supplies surfaces on the renderer's device even when the monitor
+    // cannot be duplicated through IDXGIOutput1 on that adapter.
+    try {
+        if (!capture::GraphicsCaptureSession::IsSupported()) return;
+        auto factory = winrt::get_activation_factory<capture::GraphicsCaptureItem,
+                                                     IGraphicsCaptureItemInterop>();
+        capture::GraphicsCaptureItem item{nullptr};
+        winrt::check_hresult(factory->CreateForMonitor(
+            monitor, winrt::guid_of<capture::GraphicsCaptureItem>(), winrt::put_abi(item)));
+
+        ComPtr<IDXGIDevice> dxgi;
+        winrt::check_hresult(m_gpu->device.As(&dxgi));
+        winrt::com_ptr<::IInspectable> inspectable;
+        winrt::check_hresult(::CreateDirect3D11DeviceFromDXGIDevice(dxgi.Get(), inspectable.put()));
+        auto device = inspectable.as<directx::Direct3D11::IDirect3DDevice>();
+        auto size = item.Size();
+        if (size.Width <= 0 || size.Height <= 0) return;
+        constexpr auto pixelFormat = directx::DirectXPixelFormat::B8G8R8A8UIntNormalized;
+        auto pool = capture::Direct3D11CaptureFramePool::CreateFreeThreaded(device, pixelFormat, 2, size);
+        auto session = pool.CreateCaptureSession(item);
+        auto closed = std::make_shared<std::atomic<bool>>(false);
+        auto closedRevoker = item.Closed(winrt::auto_revoke, [closed](auto&&, auto&&) {
+            closed->store(true, std::memory_order_release);
+        });
+        m_crossAdapter = false;
+        {
+            std::lock_guard<std::mutex> lock(m_shared->mtx);
+            // WGC includes the cursor in the texture.
+            m_shared->cursorVisible = false;
+        }
+
+        session.StartCapture();
+        bool first = true;
+        const ULONGLONG deadline = ::GetTickCount64() + kFirstFrameDeadlineMs;
+        while (!closed->load(std::memory_order_acquire) &&
+               ::WaitForSingleObject(m_stopEvent, 8) == WAIT_TIMEOUT) {
+            if (first && ::GetTickCount64() >= deadline) {
+                DS_WARN(L"segment %zu: Windows Graphics Capture produced no initial frame", m_index);
+                break;
+            }
+            auto frame = pool.TryGetNextFrame();
+            if (!frame) continue;
+            const auto content = frame.ContentSize();
+            if (content.Width <= 0 || content.Height <= 0) continue;
+            if (content.Width != size.Width || content.Height != size.Height) {
+                size = content;
+                frame.Close();
+                pool.Recreate(device, pixelFormat, 2, size);
+                continue;
+            }
+            ComPtr<ID3D11Texture2D> texture;
+            auto access = frame.Surface().as<IDirect3DDxgiInterfaceAccess>();
+            winrt::check_hresult(access->GetInterface(IID_PPV_ARGS(&texture)));
+            if (PublishFrame(texture.Get()) && first) {
+                DS_LOG(L"segment %zu: first Windows Graphics Capture frame %dx%d",
+                       m_index, size.Width, size.Height);
+                first = false;
+            }
+        }
+        session.Close();
+        pool.Close();
+    } catch (const winrt::hresult_error& ex) {
+        DS_WARN(L"segment %zu: Windows Graphics Capture failed: %s",
+                m_index, HrString(ex.code()));
+    }
+    std::lock_guard<std::mutex> lock(m_shared->mtx);
+    m_shared->hasFrame = false;
+}
+
 void SegmentCapture::UpdatePointer(const DXGI_OUTDUPL_FRAME_INFO& info) {
     if (info.LastMouseUpdateTime.QuadPart != 0) {
         std::lock_guard<std::mutex> lock(m_shared->mtx);
@@ -409,9 +504,19 @@ void SegmentCapture::UpdatePointer(const DXGI_OUTDUPL_FRAME_INFO& info) {
 void SegmentCapture::ThreadMain() {
     ::SetThreadDescription(::GetCurrentThread(), L"dscomp-capture");
 
+    const HRESULT apartment = ::RoInitialize(RO_INIT_MULTITHREADED);
+    if (FAILED(apartment)) DS_WARN(L"segment %zu: RoInitialize failed: %s", m_index, HrString(apartment));
     bool firstFrame = true;
+    ULONGLONG tryGraphicsCaptureAt = ::GetTickCount64() + kFirstFrameDeadlineMs;
     for (;;) {
         if (::WaitForSingleObject(m_stopEvent, 0) == WAIT_OBJECT_0) break;
+
+        if (firstFrame && SUCCEEDED(apartment) && ::GetTickCount64() >= tryGraphicsCaptureAt) {
+            TeardownDuplication();
+            TryGraphicsCapture();
+            tryGraphicsCaptureAt = ::GetTickCount64() + kFirstFrameDeadlineMs;
+            continue;
+        }
 
         if (!m_dupl) {
             if (!InitDuplication()) {
@@ -439,15 +544,20 @@ void SegmentCapture::ThreadMain() {
                 DS_WARN(L"segment %zu: AcquireNextFrame failed: %s", m_index, HrString(hr));
             }
             TeardownDuplication();
+            if (!firstFrame) tryGraphicsCaptureAt = ::GetTickCount64() + kFirstFrameDeadlineMs;
+            firstFrame = true;
             if (::WaitForSingleObject(m_stopEvent, 50) == WAIT_OBJECT_0) break;
             continue;
         }
         m_holdingFrame = true;
 
-        if (info.LastPresentTime.QuadPart != 0 || firstFrame) {
+        if (info.LastPresentTime.QuadPart != 0) {
             ComPtr<ID3D11Texture2D> tex;
             if (SUCCEEDED(resource.As(&tex)) && tex) {
-                if (PublishFrame(tex.Get())) firstFrame = false;
+                if (PublishFrame(tex.Get()) && firstFrame) {
+                    DS_LOG(L"segment %zu: first DXGI frame", m_index);
+                    firstFrame = false;
+                }
             }
         }
 
@@ -458,10 +568,13 @@ void SegmentCapture::ThreadMain() {
         if (FAILED(hr) && hr != DXGI_ERROR_INVALID_CALL) {
             DS_VERB(L"segment %zu: ReleaseFrame failed: %s", m_index, HrString(hr));
             TeardownDuplication();
+            if (!firstFrame) tryGraphicsCaptureAt = ::GetTickCount64() + kFirstFrameDeadlineMs;
+            firstFrame = true;
         }
     }
 
     TeardownDuplication();
+    if (SUCCEEDED(apartment)) ::RoUninitialize();
     DS_VERB(L"segment %zu: capture thread exiting", m_index);
 }
 

@@ -3,15 +3,25 @@
 #include <cstdio>
 #include <cstdarg>
 #include <comdef.h>
+#include <mutex>
+#include <share.h>
 
 namespace ds {
 
 namespace {
 bool g_verbose = false;
+FILE* g_file = nullptr;
+std::mutex g_fileMutex;
+size_t g_charsWritten = 0;
 }
 
-void LogInit(bool verbose) {
+void LogInit(bool verbose, const std::wstring& path) {
     g_verbose = verbose;
+    if (!path.empty()) g_file = ::_wfsopen(path.c_str(), L"w, ccs=UTF-8", _SH_DENYWR);
+}
+
+void LogClose() {
+    if (g_file) ::fclose(g_file);
 }
 
 bool LogIsVerbose() {
@@ -37,6 +47,14 @@ void LogWrite(const wchar_t* level, const wchar_t* fmt, ...) {
     ::OutputDebugStringW(line);
     ::fputws(line, stderr);
     ::fflush(stderr);
+    if (g_file) {
+        std::lock_guard<std::mutex> lock(g_fileMutex);
+        if (g_charsWritten < 32768) {
+            ::fputws(line, g_file);
+            ::fflush(g_file);
+            g_charsWritten += ::wcslen(line);
+        }
+    }
 }
 
 const wchar_t* HrString(HRESULT hr) {

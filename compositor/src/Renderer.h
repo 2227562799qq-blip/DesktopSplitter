@@ -16,6 +16,8 @@
 
 namespace ds {
 
+constexpr UINT kCompositorReadyMessage = WM_APP + 2;
+
 class Renderer {
 public:
     Renderer() = default;
@@ -82,8 +84,9 @@ private:
 
     bool CreateDevice();
     bool CreatePipeline();
-    void RenderFrame();
+    bool RenderFrame();
     bool DrawQuad(ID3D11ShaderResourceView* srv, float px, float py, float pw, float ph);
+    bool WindowReadyToPresent(bool completeFrame);
     void ThreadMain();
     void PaceFrame();
 
@@ -122,6 +125,8 @@ private:
 
     HANDLE m_contentLiveEvent = nullptr;
     uint64_t m_lastSignalledCapture = 0;
+    bool m_windowReadyPosted = false;
+    HRESULT m_lastPresentResult = S_OK;
 };
 
 } // namespace ds

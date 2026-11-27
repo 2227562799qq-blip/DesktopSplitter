@@ -11,6 +11,7 @@ BOOL CALLBACK EnumAllProc(HMONITOR hMon, HDC, LPRECT, LPARAM lp) {
     mi.cbSize = sizeof(mi);
     if (::GetMonitorInfoW(hMon, &mi)) {
         MonitorEntry e;
+        e.handle = hMon;
         e.device = mi.szDevice;
         e.rect = mi.rcMonitor;
         e.work = mi.rcWork;
@@ -53,6 +54,13 @@ bool FindMonitorWorkArea(const std::wstring& deviceName, RECT& work) {
     if (!e) return false;
     work = e->work;
     return true;
+}
+
+HMONITOR FindMonitorHandle(const std::wstring& deviceName) {
+    std::vector<MonitorEntry> all;
+    EnumerateMonitors(all);
+    const MonitorEntry* e = FindEntry(all, deviceName);
+    return e ? e->handle : nullptr;
 }
 
 size_t FindMonitorRects(const std::vector<std::wstring>& deviceNames,

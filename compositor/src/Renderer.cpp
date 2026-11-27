@@ -358,13 +358,22 @@ std::atomic<long long> g_diagLockTicks{0};      // of which: waiting for m_gpu.m
 std::atomic<long>      g_diagPresentHr{0};      // last Present HRESULT (occlusion shows here)
 }
 
-void Renderer::RenderFrame() {
-    if (!m_presenter) return;
+bool Renderer::WindowReadyToPresent(bool completeFrame) {
+    if (m_selection.kind == PresenterKind::Specialized) return true;
+    if (!completeFrame) return false;
+    if (!m_windowReadyPosted) {
+        m_windowReadyPosted = ::PostMessageW(m_hwnd, kCompositorReadyMessage, 0, 0) != FALSE;
+    }
+    return m_windowReadyPosted && ::IsWindowVisible(m_hwnd);
+}
+
+bool Renderer::RenderFrame() {
+    if (!m_presenter) return false;
     ID3D11RenderTargetView* rtv = m_presenter->BeginFrame();
-    if (!rtv) return;
+    if (!rtv) return false;
     const UINT frameW = m_presenter->Width();
     const UINT frameH = m_presenter->Height();
-    if (frameW == 0 || frameH == 0) return;
+    if (frameW == 0 || frameH == 0) return false;
 
     if (m_testPattern) {
         // Slow colour cycle: proves frames are reaching the panel, and a frozen
@@ -383,6 +392,7 @@ void Renderer::RenderFrame() {
             m_gpu.ctx->ClearRenderTargetView(rtv, clear);
             m_gpu.ctx->OMSetRenderTargets(0, nullptr, nullptr);
         }
+        if (!WindowReadyToPresent(true)) return false;
         const HRESULT thr = m_presenter->EndFrame();
         g_diagPresentHr.store(static_cast<long>(thr), std::memory_order_relaxed);
         if (FAILED(thr)) {
@@ -394,7 +404,7 @@ void Renderer::RenderFrame() {
             m_stop.store(true, std::memory_order_release);
             if (m_hwnd) ::PostMessageW(m_hwnd, WM_CLOSE, 0, 0);
         }
-        return;
+        return thr == S_OK;
     }
 
     const size_t segCount = m_cfg.segments.size();
@@ -431,6 +441,11 @@ void Renderer::RenderFrame() {
         if (snap.cursorVersion != m_cursors[i].version && !s.cursorBgra.empty()) {
             snap.cursorPixels = s.cursorBgra;
         }
+    }
+
+    if (m_selection.kind == PresenterKind::Window &&
+        std::any_of(snaps.begin(), snaps.end(), [](const Snapshot& snap) { return !snap.hasFrame; })) {
+        return false;
     }
 
     // Refresh cursor textures whose shape changed (immutable, no context needed).
@@ -558,6 +573,9 @@ void Renderer::RenderFrame() {
     ::QueryPerformanceCounter(&gt1);
     g_diagGpuTicks.fetch_add(gt1.QuadPart - gt0.QuadPart, std::memory_order_relaxed);
 
+    const bool allSegmentsDrawn = segCount != 0 && segmentsDrawn == segCount;
+    if (!WindowReadyToPresent(allSegmentsDrawn)) return false;
+
     HRESULT hr;
     LARGE_INTEGER pt0, pt1;
     ::QueryPerformanceCounter(&pt0);
@@ -567,8 +585,13 @@ void Renderer::RenderFrame() {
     g_diagPresentHr.store(static_cast<long>(hr), std::memory_order_relaxed);
     // The confirmation dialog updates once a second on segment zero. An idle
     // secondary desktop can legitimately reuse its last captured image.
-    if (hr == S_OK && segCount && segmentsDrawn == segCount && m_contentLiveEvent &&
+    if (hr != m_lastPresentResult) {
+        DS_LOG(L"present result changed: %s", HrString(hr));
+        m_lastPresentResult = hr;
+    }
+    if (hr == S_OK && allSegmentsDrawn && m_contentLiveEvent &&
         snaps[0].captureSequence != m_lastSignalledCapture) {
+        if (!m_lastSignalledCapture) DS_LOG(L"first complete presentation on all %zu segments", segCount);
         m_lastSignalledCapture = snaps[0].captureSequence;
         ::SetEvent(m_contentLiveEvent);
     }
@@ -593,6 +616,7 @@ void Renderer::RenderFrame() {
     } else if (FAILED(hr)) {
         DS_WARN(L"Present failed: %s", HrString(hr));
     }
+    return hr == S_OK;
 }
 
 void Renderer::PaceFrame() {
@@ -642,8 +666,7 @@ void Renderer::ThreadMain() {
     std::vector<uint64_t> lastCaptured(m_segments ? m_segments->size() : 0, 0);
 
     while (!m_stop.load(std::memory_order_acquire)) {
-        RenderFrame();
-        ++presented;
+        const bool framePresented = RenderFrame();
 
         // A presenter that failed after it was already presenting means the
         // display went dark. Stop rather than limping, and make the window
@@ -657,7 +680,14 @@ void Renderer::ThreadMain() {
             break;
         }
 
-        PaceFrame();
+        if (framePresented) {
+            ++presented;
+            PaceFrame();
+        } else {
+            // A hidden window or an incomplete capture has no Present to pace us.
+            m_nextPresentQpc = 0;
+            ::Sleep(10);
+        }
 
         if (LogIsVerbose()) {
             const DWORD now = ::GetTickCount();

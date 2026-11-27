@@ -27,6 +27,7 @@ private:
     void ThreadMain();
     bool InitDuplication();
     void TeardownDuplication();
+    void TryGraphicsCapture();
     bool PublishFrame(ID3D11Texture2D* acquired);
     bool EnsureSharedTexture(UINT width, UINT height);
     void UpdatePointer(const DXGI_OUTDUPL_FRAME_INFO& info);
