@@ -34,7 +34,8 @@ public static class DisplayConfig
     public const uint DeskSplitMaxGeneration = 10000000;
 
     /// <summary>Highest serial the driver can stamp (any generation, any index).</summary>
-    public static uint DeskSplitSerialMax => DeskSplitSerialBase + DeskSplitMaxGeneration * (uint)DriverClient.DESKSPLIT_MAX_MONITORS - 1;
+    public static uint DeskSplitSerialMax
+        => DeskSplitSerialBase + (DeskSplitMaxGeneration + 1) * (uint)DriverClient.DESKSPLIT_MAX_MONITORS - 1;
 
     private static readonly string[] AdapterMarkers =
     {
@@ -78,7 +79,12 @@ public static class DisplayConfig
     /// </summary>
     public static IReadOnlyList<MonitorInfo> EnumerateAll() => EnumerateCore(allPaths: true);
 
-    private static IReadOnlyList<MonitorInfo> EnumerateCore(bool allPaths)
+    // QDC_ALL_PATHS can list one connected target on several sources. For arrival,
+    // the target is the monitor's identity and a GDI source name may not exist yet.
+    internal static IReadOnlyList<MonitorInfo> EnumerateConnectedVirtualTargets()
+        => EnumerateCore(allPaths: true, connectedVirtualTargets: true);
+
+    private static IReadOnlyList<MonitorInfo> EnumerateCore(bool allPaths, bool connectedVirtualTargets = false)
     {
         (DISPLAYCONFIG_PATH_INFO[] paths, _) = allPaths ? QueryAllConfig() : QueryActiveConfig();
 
@@ -88,16 +94,21 @@ public static class DisplayConfig
         IReadOnlyDictionary<string, EdidInfo> edidMap = EdidReader.BuildMap();
 
         var byDevice = new Dictionary<string, MonitorInfo>(StringComparer.OrdinalIgnoreCase);
+        var seenTargets = new HashSet<Endpoint>();
         var ordered = new List<MonitorInfo>();
 
         foreach (DISPLAYCONFIG_PATH_INFO path in paths)
         {
             bool isActive = (path.flags & DISPLAYCONFIG_PATH_ACTIVE) != 0;
             if (!allPaths && !isActive) continue;
+            Endpoint targetKey = Endpoint.From(path.targetInfo.adapterId, path.targetInfo.id);
+            // QueryDisplayConfig returns active paths before alternate inactive paths.
+            if (connectedVirtualTargets && (!path.targetInfo.targetAvailable || !seenTargets.Add(targetKey)))
+                continue;
 
             string gdiName = GetSourceGdiName(path);
-            if (string.IsNullOrEmpty(gdiName)) continue;
-            if (byDevice.TryGetValue(gdiName, out MonitorInfo? existing))
+            if (!connectedVirtualTargets && string.IsNullOrEmpty(gdiName)) continue;
+            if (!connectedVirtualTargets && byDevice.TryGetValue(gdiName, out MonitorInfo? existing))
             {
                 // Same GDI device on two paths (clone group, or the same target
                 // listed once active and once inactive): prefer the active entry.
@@ -113,8 +124,12 @@ public static class DisplayConfig
 
             TargetNameInfo target = GetTargetName(path);
             string adapterPath = GetAdapterPath(path);
+            EdidReader.TryLookup(edidMap, target.DevicePath, out EdidInfo? edid);
+            bool isDeskSplitVirtual = IsOurVirtualMonitor(target, adapterPath, edid);
+            if (connectedVirtualTargets && !isDeskSplitVirtual) continue;
 
-            ModeSurvey survey = SurveyModes(gdiName);
+            ModeSurvey survey = string.IsNullOrEmpty(gdiName) || (connectedVirtualTargets && !isActive)
+                ? default : SurveyModes(gdiName);
             uint currentRefreshMhz = path.targetInfo.refreshRate.ToMillihertz();
 
             // Exact millihertz is only knowable for the mode currently in use. If the
@@ -133,8 +148,6 @@ public static class DisplayConfig
 
             deviceFlags.TryGetValue(gdiName, out uint flags);
 
-            EdidReader.TryLookup(edidMap, target.DevicePath, out EdidInfo? edid);
-
             // Exact current-mode rational when DisplayConfig supplies one, else whole Hz.
             uint currentMillihertz = currentRefreshMhz != 0
                 ? currentRefreshMhz
@@ -147,7 +160,7 @@ public static class DisplayConfig
                 AdapterIdLow = path.targetInfo.adapterId.LowPart,
                 AdapterIdHigh = path.targetInfo.adapterId.HighPart,
                 TargetId = path.targetInfo.id,
-                FriendlyName = string.IsNullOrWhiteSpace(target.FriendlyName)
+                FriendlyName = string.IsNullOrWhiteSpace(target.FriendlyName) && !string.IsNullOrEmpty(gdiName)
                     ? FallbackName(gdiName)
                     : target.FriendlyName.Trim(),
                 AdapterPath = adapterPath,
@@ -169,10 +182,10 @@ public static class DisplayConfig
                 CurrentRefreshMillihertz = currentMillihertz,
                 IsPrimary = (flags & DISPLAY_DEVICE_PRIMARY_DEVICE) != 0,
                 IsActivePath = isActive,
-                IsDeskSplitVirtual = IsOurVirtualMonitor(target, adapterPath, edid),
+                IsDeskSplitVirtual = isDeskSplitVirtual,
             };
 
-            byDevice[gdiName] = info;
+            if (!connectedVirtualTargets) byDevice[gdiName] = info;
             ordered.Add(info);
         }
 
@@ -204,8 +217,14 @@ public static class DisplayConfig
     private static (DISPLAYCONFIG_PATH_INFO[] Paths, DISPLAYCONFIG_MODE_INFO[] Modes) QueryActiveConfig()
         => QueryConfig(QDC_ONLY_ACTIVE_PATHS);
 
-    private static (DISPLAYCONFIG_PATH_INFO[] Paths, DISPLAYCONFIG_MODE_INFO[] Modes) QueryAllConfig()
+    internal static (DISPLAYCONFIG_PATH_INFO[] Paths, DISPLAYCONFIG_MODE_INFO[] Modes) QueryAllConfig()
         => QueryConfig(QDC_ALL_PATHS);
+
+    internal readonly record struct Endpoint(uint AdapterLow, int AdapterHigh, uint Id)
+    {
+        internal static Endpoint From(LUID adapter, uint id) => new(adapter.LowPart, adapter.HighPart, id);
+        public override string ToString() => $"{AdapterHigh:X8}:{AdapterLow:X8}#{Id}";
+    }
 
     /// <summary>
     /// Raw QDC_ALL_PATHS entry for one GDI device, for the SetDisplayConfig

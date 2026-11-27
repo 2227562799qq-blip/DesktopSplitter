@@ -116,6 +116,7 @@ public static class ApplyService
     private static readonly TimeSpan CompositorStopTimeout = TimeSpan.FromSeconds(10);
     private static readonly TimeSpan PollInterval = TimeSpan.FromMilliseconds(400);
     private static readonly TimeSpan EdidMappingRetryTimeout = TimeSpan.FromSeconds(3);
+    private static readonly TimeSpan ActivePathRetryTimeout = TimeSpan.FromSeconds(3);
 
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
 
@@ -328,24 +329,18 @@ public static class ApplyService
     /// Production never passes it.
     /// </summary>
     internal static IReadOnlyList<MonitorInfo> CreateVirtualMonitors(
-        ApplyRequest request, HashSet<string> baseline,
-        IProgress<string> log, CancellationToken ct, uint? generationOverride = null,
+        ApplyRequest request, IProgress<string> log, CancellationToken ct, uint? generationOverride = null,
         bool newestDisplayFallback = false)
     {
         int segmentCount = request.Layout.SegmentCount;
         uint generation = generationOverride ?? ClaimNextDisplayGeneration(log);
 
-        // Virtual monitors that already exist before this apply. Stale entries
-        // from earlier attempts stay in the display database with our EDID
-        // cached, and QDC_ALL_PATHS still lists them — the wait must count
-        // only monitors this apply creates, or it sees 4 when it wants 2.
-        var virtualBaseline = DisplayConfig.EnumerateAll()
-            .Where(m => m.IsDeskSplitVirtual)
-            .Select(m => m.DeviceName)
-            .ToHashSet(StringComparer.OrdinalIgnoreCase);
-        log.Report(virtualBaseline.Count == 0
+        IReadOnlyList<MonitorInfo> existing = newestDisplayFallback
+            ? DisplayConfig.EnumerateAll().Where(m => m.IsDeskSplitVirtual).ToList()
+            : DisplayConfig.EnumerateConnectedVirtualTargets();
+        log.Report(existing.Count == 0
             ? "点应用前没有已存在的虚拟显示器。"
-            : $"点应用前已有虚拟显示器 {virtualBaseline.Count} 台：{string.Join("、", virtualBaseline.OrderBy(n => DisplayConfig.DeviceIndex(n)))}。");
+            : $"点应用前已有虚拟显示器 {existing.Count} 台：{DescribeMonitors(existing)}。");
 
         // a. Build and send DESKSPLIT_CONFIG.
         DESKSPLIT_CONFIG cfg = BuildDriverConfig(request.Physical, request.Layout, request.Resolutions, generation);
@@ -369,19 +364,21 @@ public static class ApplyService
         // b. Wait for the virtual monitors to arrive.
         log.Report($"等待 {segmentCount} 台虚拟显示器出现（最多 {MonitorArrivalTimeout.TotalSeconds:0} 秒）……");
         IReadOnlyList<MonitorInfo> arrived = newestDisplayFallback
-            ? WaitForVirtualMonitorsByNewestDisplay(segmentCount, virtualBaseline, log, ct)
-            : WaitForVirtualMonitors(segmentCount, virtualBaseline, log, ct);
+            ? WaitForVirtualMonitorsByNewestDisplay(segmentCount,
+                existing.Select(m => m.DeviceName).ToHashSet(StringComparer.OrdinalIgnoreCase), log, ct)
+            : WaitForVirtualMonitors(segmentCount, generation,
+                existing.Select(m => m.DisplayTarget).ToHashSet(), ct);
         foreach (MonitorInfo m in arrived)
         {
-            log.Report($"  找到 {m.DeviceName}（{m.FriendlyName}）" +
+            log.Report($"  找到 {m.FriendlyName}（目标 {m.DisplayTarget}，路径 {DisplayPathName(m)}）" +
                        (m.Edid is null ? "  [无 EDID]" : $"  [{m.Edid}]") +
-                       (m.IsActivePath ? string.Empty : "  [路径未激活，排列时激活]"));
+                       (m.IsActivePath ? string.Empty : "  [路径未激活]"));
         }
 
         // Map segment i -> the monitor the driver created as DESKSPLIT_CONFIG.Monitors[i],
         // identified by the EDID serial the driver stamps
         // (0xD5000001 + generation * 4 + index; the index is the serial's low bits).
-        return MapSegmentsToMonitors(baseline, arrived, segmentCount, log, ct);
+        return MapSegmentsToMonitors(arrived, segmentCount, log, ct, newestDisplayFallback);
     }
 
     private static ApplyResult ApplyCore(
@@ -404,12 +401,7 @@ public static class ApplyService
             CompositorLauncher.StopAndWait(CompositorStopTimeout, log.Report);
         }
 
-        // Baseline: everything that is NOT one of our virtual monitors.
         IReadOnlyList<MonitorInfo> before = DisplayConfig.Enumerate();
-        var baseline = before
-            .Where(m => !m.IsDeskSplitVirtual)
-            .Select(m => m.DeviceName)
-            .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
         // Remember which display was primary BEFORE we touch anything — Revert restores
         // exactly this monitor, which is not necessarily the one being split.
@@ -418,7 +410,8 @@ public static class ApplyService
         // a–b. Build + send DESKSPLIT_CONFIG, wait for arrival, map segments to
         // monitors (see CreateVirtualMonitors; production claims a fresh
         // generation every apply).
-        IReadOnlyList<MonitorInfo> virtualMonitors = CreateVirtualMonitors(request, baseline, log, ct);
+        IReadOnlyList<MonitorInfo> virtualMonitors = CreateVirtualMonitors(request, log, ct);
+        DisplayTopology.ActivateVirtualTargets(virtualMonitors, log, ct);
 
         // c. Arrange them contiguously to the right of the physical monitor and promote
         //    segment 1's virtual monitor to PRIMARY, in one batch. The shell anchors the Start
@@ -429,7 +422,9 @@ public static class ApplyService
         //    (typically segment 1 already primary and the physical monitor moved left of it),
         //    so positions are computed from where the physical monitor is NOW.
         log.Report("正在虚拟桌面中排列虚拟显示器……");
-        IReadOnlyList<MonitorInfo> current = DisplayConfig.Enumerate();
+        var desktop = ReadActiveDesktop(virtualMonitors, log, ct);
+        IReadOnlyList<MonitorInfo> current = desktop.Monitors;
+        virtualMonitors = desktop.VirtualMonitors;
         MonitorInfo physicalNow = current.FirstOrDefault(m => SameDevice(m.DeviceName, physical.DeviceName))
             ?? throw new ApplyException($"{physical.DeviceName} 已不再活动，无法把分屏放在它旁边。");
         IReadOnlyList<DisplayArranger.VirtualPlacement> placements =
@@ -439,13 +434,8 @@ public static class ApplyService
             DisplayArranger.ComposeLayout(current, placements, VirtualRefreshHz, appliedPrimaryDevice),
             log.Report);
 
-        // Re-read so config.json records what Windows actually settled on, keeping the
-        // segment -> monitor mapping established above.
-        var refreshed = new Dictionary<string, MonitorInfo>(StringComparer.OrdinalIgnoreCase);
-        foreach (MonitorInfo m in SafeEnumerate()) refreshed[m.DeviceName] = m;
-        virtualMonitors = virtualMonitors
-            .Select(v => refreshed.TryGetValue(v.DeviceName, out MonitorInfo? cur) ? cur : v)
-            .ToList();
+        // Use the active source for each target when writing the compositor configuration.
+        virtualMonitors = ReadActiveDesktop(virtualMonitors, log, ct).VirtualMonitors;
 
         // d. Write %ProgramData%\DesktopSplitter\config.json.
         // physRects mirror the editor: track sizes are normalised onto the monitor's real
@@ -1119,13 +1109,12 @@ public static class ApplyService
 
     /// <summary>
     /// Orders the arrived virtual monitors so that index i is the monitor the driver created
-    /// from DESKSPLIT_CONFIG.Monitors[i], using the EDID serial (0xD5000001 + index) that the
-    /// driver stamps. Falls back to positional \\.\DISPLAYn order with a logged warning when
-    /// the EDIDs are unreadable, incomplete or ambiguous.
+    /// from DESKSPLIT_CONFIG.Monitors[i], using the EDID serial stamped by the driver.
+    /// Keeps the arrival order if Windows has no complete EDID mapping.
     /// </summary>
     private static IReadOnlyList<MonitorInfo> MapSegmentsToMonitors(
-        HashSet<string> baseline, IReadOnlyList<MonitorInfo> arrived, int segmentCount,
-        IProgress<string> log, CancellationToken ct)
+        IReadOnlyList<MonitorInfo> arrived, int segmentCount,
+        IProgress<string> log, CancellationToken ct, bool newestDisplayFallback)
     {
         // Windows caches a monitor's EDID under its devnode shortly after arrival; on the
         // first read it may not be there yet. Retry with fresh enumerations (each one
@@ -1141,7 +1130,7 @@ public static class ApplyService
                 for (int i = 0; i < mapped.Count; i++)
                 {
                     EdidInfo edid = mapped[i].Edid!;
-                    log.Report($"  分区 {i + 1} -> {mapped[i].DeviceName} " +
+                    log.Report($"  分区 {i + 1} -> 目标 {mapped[i].DisplayTarget}（{DisplayPathName(mapped[i])}）" +
                                $"（序列号 0x{edid.SerialNumber:X8}，产品代码 0x{edid.ProductCode:X4}）");
                     if (edid.ProductCode != i)
                     {
@@ -1155,18 +1144,58 @@ public static class ApplyService
             if (DateTime.UtcNow >= deadline || ct.IsCancellationRequested) break;
             ct.WaitHandle.WaitOne(PollInterval);
 
-            var refreshed = SafeEnumerate()
-                .Where(m => m.IsDeskSplitVirtual || !baseline.Contains(m.DeviceName))
-                .OrderBy(m => DisplayConfig.DeviceIndex(m.DeviceName))
-                .ThenBy(m => m.DeviceName, StringComparer.OrdinalIgnoreCase)
-                .ToList();
-            if (refreshed.Count == arrived.Count) arrived = refreshed;
+            if (newestDisplayFallback)
+            {
+                var byName = SafeEnumerateAll().ToDictionary(m => m.DeviceName, StringComparer.OrdinalIgnoreCase);
+                arrived = arrived.Select(m => byName.GetValueOrDefault(m.DeviceName, m)).ToList();
+            }
+            else
+            {
+                var byTarget = SafeEnumerateConnectedVirtualTargets().ToDictionary(m => m.DisplayTarget);
+                arrived = arrived.Select(m => byTarget.GetValueOrDefault(m.DisplayTarget, m)).ToList();
+            }
         }
 
-        log.Report($"警告：{reason}——回退到按 \\\\.\\DISPLAYn 位置顺序映射。" +
+        log.Report($"警告：{reason}——回退到按枚举顺序映射。" +
                    "分区可能会落到错误的虚拟显示器上。");
         return arrived;
     }
+
+    internal static (IReadOnlyList<MonitorInfo> Monitors, IReadOnlyList<MonitorInfo> VirtualMonitors) ReadActiveDesktop(
+        IReadOnlyList<MonitorInfo> virtualMonitors, IProgress<string> log, CancellationToken ct)
+    {
+        // Windows may publish the active path before GDI can report its name and mode.
+        DateTime deadline = DateTime.UtcNow + ActivePathRetryTimeout;
+        while (true)
+        {
+            ct.ThrowIfCancellationRequested();
+            IReadOnlyList<MonitorInfo> current = SafeEnumerate();
+            var live = virtualMonitors.Select(v => current.FirstOrDefault(m =>
+                m.DisplayTarget == v.DisplayTarget && m.IsDeskSplitVirtual &&
+                m.CurrentWidth > 0 && m.CurrentHeight > 0)).ToList();
+            if (live.All(m => m is not null))
+            {
+                var resolved = live.Select(m => m!).ToList();
+                for (int i = 0; i < resolved.Count; i++)
+                {
+                    MonitorInfo previous = virtualMonitors[i];
+                    if (!previous.IsActivePath || !SameDevice(resolved[i].DeviceName, previous.DeviceName))
+                        log.Report($"  分区 {i + 1} 的目标 {previous.DisplayTarget} 当前使用 {resolved[i].DeviceName}。");
+                }
+                return (current, resolved);
+            }
+            if (DateTime.UtcNow >= deadline)
+            {
+                int missing = live.FindIndex(m => m is null);
+                throw new ApplyException(
+                    $"分区 {missing + 1} 的虚拟显示目标 {virtualMonitors[missing].DisplayTarget} 没有可用的活动路径。");
+            }
+            ct.WaitHandle.WaitOne(PollInterval);
+        }
+    }
+
+    private static string DisplayPathName(MonitorInfo monitor)
+        => string.IsNullOrEmpty(monitor.DeviceName) ? "尚无 GDI 名称" : monitor.DeviceName;
 
     private static bool TryMapByEdid(
         IReadOnlyList<MonitorInfo> arrived, int segmentCount,
@@ -1203,101 +1232,46 @@ public static class ApplyService
     }
 
     /// <summary>
-    /// Waits until the driver-created virtual monitors show up in the display
-    /// topology. Counts on arrival (all paths), not on activation: on some
-    /// machines Windows is slow to activate a newly arrived indirect-display
-    /// path, and the old active-paths-only wait then timed out after 15 seconds
-    /// reporting 0 monitors even though the driver had created them. The
-    /// arrange step that follows activates the paths explicitly, so arriving
-    /// is enough to proceed. Only monitors created by THIS apply are counted:
-    /// stale entries from earlier attempts stay in the display database with
-    /// our EDID cached, and QDC_ALL_PATHS still lists them, so without the
-    /// <paramref name="virtualBaseline"/> exclusion the wait sees 4 when it
-    /// wants 2 and times out even though the driver created both monitors.
-    /// When more than the expected number show up anyway (duplicates of the
-    /// same EDID index, or other drivers' monitors read as ours), the wait
-    /// also succeeds once every expected EDID index (0..expected-1) is present
-    /// and returns one entry per index — preferring an active path, then the
-    /// highest DISPLAY number (the newest arrival). The duplicate rule only
-    /// applies after 2 seconds so a just-arrived monitor's EDID has time to
-    /// be cached first. When the EDID serials alias — after a disconnect +
-    /// revert, re-arrived monitors can all resolve to the same EDID, so no
-    /// index 1 ever shows up — the wait falls back to one entry per
-    /// display-config target (adapter + target id), which still tells the
-    /// monitors apart. On timeout the message lists every monitor found, so
-    /// the next failure names the extras instead of only counting them.
+    /// Counts connected targets from this generation. A new target whose EDID
+    /// has not been cached yet can still count if it was absent before the IOCTL.
     /// </summary>
     private static IReadOnlyList<MonitorInfo> WaitForVirtualMonitors(
-        int expected, HashSet<string> virtualBaseline, IProgress<string> log, CancellationToken ct)
+        int expected, uint generation, HashSet<DisplayConfig.Endpoint> virtualBaseline, CancellationToken ct)
     {
-        DateTime started = DateTime.UtcNow;
-        DateTime deadline = started + MonitorArrivalTimeout;
+        DateTime deadline = DateTime.UtcNow + MonitorArrivalTimeout;
+        IReadOnlyList<MonitorInfo> allVirtual = Array.Empty<MonitorInfo>();
         List<MonitorInfo> found = new();
-        int preExisting = 0;
 
         while (DateTime.UtcNow < deadline)
         {
             ct.ThrowIfCancellationRequested();
 
-            List<MonitorInfo> allVirtual = SafeEnumerateAll()
-                .Where(m => m.IsDeskSplitVirtual)
-                .ToList();
-            found = allVirtual
-                .Where(m => !virtualBaseline.Contains(m.DeviceName))
-                .OrderBy(m => DisplayConfig.DeviceIndex(m.DeviceName))
-                .ThenBy(m => m.DeviceName, StringComparer.OrdinalIgnoreCase)
-                .ToList();
-            preExisting = allVirtual.Count - found.Count;
+            allVirtual = SafeEnumerateConnectedVirtualTargets();
+            var targets = allVirtual.Select(m => (Monitor: m, Generation: DisplayConfig.DeskSplitGenerationFromEdid(m.Edid))).ToList();
+            var stamped = targets.Where(t => t.Generation == (int)generation).Select(t => t.Monitor).ToList();
+            if (stamped.Count == expected) return stamped;
 
+            found = targets.Where(t => t.Generation == (int)generation ||
+                                       (t.Generation < 0 && !virtualBaseline.Contains(t.Monitor.DisplayTarget)))
+                .Select(t => t.Monitor).ToList();
             if (found.Count == expected) return found;
-
-            if (found.Count > expected &&
-                DateTime.UtcNow - started >= TimeSpan.FromSeconds(2) &&
-                TryDedupByEdidIndex(found, expected, out List<MonitorInfo> deduped))
-            {
-                log.Report($"新建的虚拟显示器多于预期（{found.Count} 台），已按 EDID 序列号去重，重复索引取编号最大的。");
-                return deduped;
-            }
-
-            // The EDID serials can alias: after a disconnect + revert, the
-            // re-arrived monitors may all resolve to the same EDID (the
-            // display database hands every inactive path the same target's
-            // EDID), so the serial cannot tell the monitors apart and the
-            // rule above never sees every expected index. The path's own
-            // target id still can — one entry per (adapter, target).
-            if (found.Count > expected &&
-                DateTime.UtcNow - started >= TimeSpan.FromSeconds(2) &&
-                TryDedupByTarget(found, expected, out List<MonitorInfo> byTarget))
-            {
-                log.Report($"新建的虚拟显示器多于预期（{found.Count} 台），EDID 序列号重复无法区分，已按显示路径目标去重。");
-                return byTarget;
-            }
 
             ct.WaitHandle.WaitOne(PollInterval);
         }
 
         throw new ApplyException(
             $"等待虚拟显示器超时（{MonitorArrivalTimeout.TotalSeconds:0} 秒）：" +
-            $"应有 {expected} 台，本次新建看到 {found.Count} 台" +
-            (preExisting > 0 ? $"（另有 {preExisting} 台以前留下的虚拟显示器未计入）" : "") +
-            $"：{DescribeMonitors(found)}。{DriverStatusText()}");
+            $"应有 {expected} 个目标，本次匹配到 {found.Count} 个。" +
+            $"已连接目标：{DescribeMonitors(allVirtual)}。{DriverStatusText()}");
     }
 
     /// <summary>
     /// Repro-only wait: identifies the newly arrived virtual monitors by GDI
-    /// device number instead of by identity. After a disconnect + revert,
-    /// re-arrived monitors can all resolve to the same EDID (round 3: all
-    /// four paths decoded to serial 0xD5000009, index 0), and the target
-    /// dedup in <see cref="WaitForVirtualMonitors"/> sees the wrong number
-    /// of groups too — so neither identity rule can tell the new monitors
-    /// from the stale path records. GDI device names are handed out in
-    /// arrival order, so the stale records keep their old numbers and the
-    /// new arrivals take the highest numbers. Waits until at least
+    /// device number to reproduce the older behavior when the same generation
+    /// is created twice. Waits until at least
     /// <paramref name="expected"/> new paths have arrived and the count has
     /// been stable for 2 seconds (late paths still trickling in), then
-    /// returns the highest-numbered ones. Production never uses this: every
-    /// production apply claims a fresh generation, so its identities never
-    /// collide like this.
+    /// returns the highest-numbered ones.
     /// </summary>
     private static IReadOnlyList<MonitorInfo> WaitForVirtualMonitorsByNewestDisplay(
         int expected, HashSet<string> virtualBaseline, IProgress<string> log, CancellationToken ct)
@@ -1355,90 +1329,6 @@ public static class ApplyService
             $"：{DescribeMonitors(found)}。{DriverStatusText()}");
     }
 
-    /// <summary>
-    /// Picks one entry per expected EDID index (0..expected-1) out of a list
-    /// that has more entries than expected. Returns false unless every index
-    /// is represented. Among duplicates of one index, prefer an active path,
-    /// then the highest DISPLAY number (the newest arrival).
-    /// </summary>
-    private static bool TryDedupByEdidIndex(
-        IReadOnlyList<MonitorInfo> found, int expected, out List<MonitorInfo> deduped)
-    {
-        var byIndex = new Dictionary<int, MonitorInfo>();
-        foreach (MonitorInfo m in found)
-        {
-            int index = m.DeskSplitMonitorIndex;
-            if (index < 0 || index >= expected) continue;
-            if (!byIndex.TryGetValue(index, out MonitorInfo? current) ||
-                (!current.IsActivePath && m.IsActivePath) ||
-                (current.IsActivePath == m.IsActivePath &&
-                 DisplayConfig.DeviceIndex(m.DeviceName) > DisplayConfig.DeviceIndex(current.DeviceName)))
-            {
-                byIndex[index] = m;
-            }
-        }
-
-        if (byIndex.Count != expected ||
-            Enumerable.Range(0, expected).Any(i => !byIndex.ContainsKey(i)))
-        {
-            deduped = new List<MonitorInfo>();
-            return false;
-        }
-
-        deduped = Enumerable.Range(0, expected).Select(i => byIndex[i]).ToList();
-        return true;
-    }
-
-    /// <summary>
-    /// Picks one entry per display-config target (adapter LUID + target id) out
-    /// of a list that has more entries than expected. Fallback when the EDID
-    /// serials alias: after a disconnect + revert, re-arrived monitors can all
-    /// resolve to the same EDID, so the serial cannot tell the monitors apart
-    /// — but the path's own target id still can (each live monitor has its own
-    /// target; the extra entries are the same target listed on another source).
-    /// Returns false unless the entries cover exactly the expected number of
-    /// distinct targets. Among duplicates of one target, prefer an active path,
-    /// then a path whose mode list is readable (a live source reports modes; a
-    /// stale source reports none), then the highest DISPLAY number.
-    /// </summary>
-    private static bool TryDedupByTarget(
-        IReadOnlyList<MonitorInfo> found, int expected, out List<MonitorInfo> deduped)
-    {
-        var byTarget = new Dictionary<(uint Low, int High, uint Target), MonitorInfo>();
-        foreach (MonitorInfo m in found)
-        {
-            var key = (m.AdapterIdLow, m.AdapterIdHigh, m.TargetId);
-            if (!byTarget.TryGetValue(key, out MonitorInfo? current) || PreferOver(m, current))
-            {
-                byTarget[key] = m;
-            }
-        }
-
-        if (byTarget.Count != expected)
-        {
-            deduped = new List<MonitorInfo>();
-            return false;
-        }
-
-        deduped = byTarget.Values
-            .OrderBy(m => DisplayConfig.DeviceIndex(m.DeviceName))
-            .ThenBy(m => m.DeviceName, StringComparer.OrdinalIgnoreCase)
-            .ToList();
-        return true;
-
-        // Prefer an active path; then a path whose mode list is readable (a
-        // live source reports modes, a stale source reports none); then the
-        // highest DISPLAY number (the newest arrival).
-        static bool PreferOver(MonitorInfo candidate, MonitorInfo current)
-        {
-            if (candidate.IsActivePath != current.IsActivePath) return candidate.IsActivePath;
-            bool candidateModes = candidate.MaxWidth > 0 && candidate.MaxHeight > 0;
-            bool currentModes = current.MaxWidth > 0 && current.MaxHeight > 0;
-            if (candidateModes != currentModes) return candidateModes;
-            return DisplayConfig.DeviceIndex(candidate.DeviceName) > DisplayConfig.DeviceIndex(current.DeviceName);
-        }
-    }
-
     /// <summary>One line per monitor for the timeout message. The display-config
     /// target id (adapter LUID + target id) is printed too: after a disconnect +
     /// revert, re-arrived paths can all resolve to the same EDID, and the target
@@ -1447,9 +1337,9 @@ public static class ApplyService
         => monitors.Count == 0
             ? "无"
             : string.Join("；", monitors.Select(m =>
-                $"{m.DeviceName}（索引{(m.DeskSplitMonitorIndex < 0 ? "无EDID" : m.DeskSplitMonitorIndex.ToString())}" +
+                $"{DisplayPathName(m)}（索引{(m.DeskSplitMonitorIndex < 0 ? "无EDID" : m.DeskSplitMonitorIndex.ToString())}" +
                 (m.Edid is null ? string.Empty : $"，{m.Edid}") +
-                $"，目标 {m.AdapterIdLow:X8}:{m.AdapterIdHigh:X8}#{m.TargetId}" +
+                $"，目标 {m.DisplayTarget}" +
                 $"，{(m.IsActivePath ? "已激活" : "未激活")}）"));
 
     /// <summary>
@@ -1495,6 +1385,12 @@ public static class ApplyService
     private static IReadOnlyList<MonitorInfo> SafeEnumerateAll()
     {
         try { return DisplayConfig.EnumerateAll(); }
+        catch (DisplayConfigException) { return Array.Empty<MonitorInfo>(); }
+    }
+
+    private static IReadOnlyList<MonitorInfo> SafeEnumerateConnectedVirtualTargets()
+    {
+        try { return DisplayConfig.EnumerateConnectedVirtualTargets(); }
         catch (DisplayConfigException) { return Array.Empty<MonitorInfo>(); }
     }
 

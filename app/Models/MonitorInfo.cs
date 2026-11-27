@@ -94,6 +94,8 @@ public sealed class MonitorInfo
     /// <summary>DisplayConfig target id — with the adapter LUID this addresses the monitor.</summary>
     public uint TargetId { get; init; }
 
+    internal DisplayConfig.Endpoint DisplayTarget => new(AdapterIdLow, AdapterIdHigh, TargetId);
+
     public bool IsPrimary { get; init; }
 
     /// <summary>

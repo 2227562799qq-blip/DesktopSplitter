@@ -357,8 +357,7 @@ public static class DisplayArranger
         int rc = SetDisplayConfig(
             (uint)paths.Count, paths.ToArray(),
             (uint)modes.Count, modes.ToArray(),
-            SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES | SDC_SAVE_TO_DATABASE | SDC_APPLY,
-            IntPtr.Zero);
+            SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES | SDC_SAVE_TO_DATABASE | SDC_APPLY);
         if (rc != 0)
             throw new DisplayArrangeException($"SetDisplayConfig 返回 Win32 错误 {rc}。");
 

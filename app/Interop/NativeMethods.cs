@@ -77,6 +77,9 @@ internal static class NativeMethods
     }
 
     internal const uint DISPLAYCONFIG_PATH_ACTIVE = 0x00000001;
+    internal const uint DISPLAYCONFIG_PATH_MODE_IDX_INVALID = uint.MaxValue;
+    internal const uint DISPLAYCONFIG_ROTATION_IDENTITY = 1;
+    internal const uint DISPLAYCONFIG_SCALING_IDENTITY = 1;
 
     internal const uint DISPLAYCONFIG_SCANLINE_ORDERING_PROGRESSIVE = 1;
 
@@ -285,7 +288,7 @@ internal static class NativeMethods
     internal static extern int SetDisplayConfig(
         uint numPathArrayElements, DISPLAYCONFIG_PATH_INFO[]? pathArray,
         uint numModeInfoArrayElements, DISPLAYCONFIG_MODE_INFO[]? modeInfoArray,
-        uint flags, IntPtr reserved);
+        uint flags);
 
     // ---------------------------------------------------------------- DEVMODE / ChangeDisplaySettingsEx
 

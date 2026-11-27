@@ -336,7 +336,7 @@ public static class ApplySelfTest
         try
         {
             first = ApplyService.CreateVirtualMonitors(
-                request, NonVirtualBaseline(), log, CancellationToken.None, gen);
+                request, log, CancellationToken.None, gen);
         }
         catch (Exception ex)
         {
@@ -397,7 +397,7 @@ public static class ApplySelfTest
             // records keep the old numbers and the new monitors take
             // the highest ones.
             second = ApplyService.CreateVirtualMonitors(
-                request, NonVirtualBaseline(), log, CancellationToken.None, gen,
+                request, log, CancellationToken.None, gen,
                 newestDisplayFallback: true);
         }
         catch (Exception ex)
@@ -493,7 +493,7 @@ public static class ApplySelfTest
         try
         {
             virtualMonitors = ApplyService.CreateVirtualMonitors(
-                request60, NonVirtualBaseline(), log, CancellationToken.None);
+                request60, log, CancellationToken.None);
         }
         catch (Exception ex)
         {
@@ -502,7 +502,10 @@ public static class ApplySelfTest
         }
         try
         {
-            IReadOnlyList<MonitorInfo> current = DisplayConfig.Enumerate();
+            DisplayTopology.ActivateVirtualTargets(virtualMonitors, log, CancellationToken.None);
+            var desktop = ApplyService.ReadActiveDesktop(virtualMonitors, log, CancellationToken.None);
+            IReadOnlyList<MonitorInfo> current = desktop.Monitors;
+            virtualMonitors = desktop.VirtualMonitors;
             MonitorInfo? physicalNow = current.FirstOrDefault(m => !m.IsDeskSplitVirtual);
             if (physicalNow is null)
             {
@@ -524,7 +527,8 @@ public static class ApplySelfTest
             }
             var result = new ApplyResult
             {
-                VirtualMonitors = virtualMonitors,
+                VirtualMonitors = ApplyService.ReadActiveDesktop(virtualMonitors, log, CancellationToken.None)
+                    .VirtualMonitors,
                 ConfigPath = string.Empty,
                 CompositorPid = 0,
             };
@@ -582,12 +586,6 @@ public static class ApplySelfTest
         log.Report("INACTIVE-REPRO: NOT-REPRODUCED — old arrange SUCCEEDED on inactive monitors.");
         return false;
     }
-
-    private static HashSet<string> NonVirtualBaseline()
-        => DisplayConfig.Enumerate()
-            .Where(m => !m.IsDeskSplitVirtual)
-            .Select(m => m.DeviceName)
-            .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>True once every named monitor is present but inactive (bounded wait).</summary>
     private static bool WaitUntilInactive(Log log, IReadOnlyList<string> deviceNames, TimeSpan timeout)
