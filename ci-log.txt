@@ -1,0 +1,566 @@
+**********************
+PowerShell transcript start
+Start time: 20261127032810
+Username: runnervmhh3zg\runneradmin
+RunAs User: runnervmhh3zg\runneradmin
+Configuration Name: 
+Machine: runnervmhh3zg (Microsoft Windows NT 10.0.20348.0)
+Host Application: C:\Program Files\PowerShell\7\pwsh.dll -command . 'D:\a\_temp\046a009d-f031-4d6f-ba49-4bde70c94296.ps1'
+Process ID: 5416
+PSVersion: 7.6.10
+PSEdition: Core
+GitCommitId: 7.6.10
+OS: Microsoft Windows 10.0.20348
+Platform: Win32NT
+PSCompatibleVersions: 1.0, 2.0, 3.0, 4.0, 5.0, 5.1, 6.0, 7.0
+PSRemotingProtocolVersion: 2.4
+SerializationVersion: 1.1.0.1
+WSManStackVersion: 3.0
+**********************
+
+########## ENVIRONMENT ##########
+PSVersion: 7.6.10
+OS: Microsoft Windows NT 10.0.20348.0
+Elevated: True
+
+
+winget:
+
+########## INSTALL WINDOWS SDK 10.0.26100 (if missing) ##########
+SDK 26100 already present, skipping
+
+########## INSTALL WDK 10.0.26100 (if IddCx missing) ##########
+IddCx headers already present, skipping WDK install
+
+########## ADD WDK COMPONENT TO VISUAL STUDIO ##########
+VS path: C:\Program Files\Microsoft Visual Studio\2022\Enterprise
+VS modify exit code: 0
+msbuild: C:\Program Files\Microsoft Visual Studio\2022\Enterprise\MSBuild\Current\Bin\amd64\MSBuild.exe
+
+########## GENERATE VERSION FILES (same as build.ps1, NoVersionBump) ##########
+version: 0.6.14
+
+########## BUILD compositor ##########
+>> compositor : C:\Program Files\Microsoft Visual Studio\2022\Enterprise\MSBuild\Current\Bin\amd64\MSBuild.exe compositor\dscomp.vcxproj /p:Configuration=Release /p:Platform=x64 /v:m /nologo
+<< compositor exit code: 0
+
+########## BUILD devcreate ##########
+>> devcreate : C:\Program Files\Microsoft Visual Studio\2022\Enterprise\MSBuild\Current\Bin\amd64\MSBuild.exe installer\devcreate\devcreate.vcxproj /p:Configuration=Release /p:Platform=x64 /v:m /nologo
+<< devcreate exit code: 0
+
+########## BUILD edidoverride ##########
+>> edidoverride : C:\Program Files\Microsoft Visual Studio\2022\Enterprise\MSBuild\Current\Bin\amd64\MSBuild.exe installer\edid-override\edidoverride.vcxproj /p:Configuration=Release /p:Platform=x64 /v:m /nologo
+<< edidoverride exit code: 0
+
+########## BUILD app (dotnet) ##########
+>> app : dotnet build app\DesktopSplitter.csproj -c Release --nologo --disable-build-servers
+<< app exit code: 0
+
+########## BUILD driver ##########
+>> driver : C:\Program Files\Microsoft Visual Studio\2022\Enterprise\MSBuild\Current\Bin\amd64\MSBuild.exe driver\DesktopSplitterVdd.vcxproj /p:Configuration=Release /p:Platform=x64 /p:Inf2CatUseLocalTime=true /v:m /nologo
+<< driver exit code: 0
+
+########## DRIVER CATALOG SIGNATURE ##########
+  desktopsplittervdd.cat 2686
+  DesktopSplitterVdd.dll 69856
+  DesktopSplitterVdd.inf 2498
+catalog signature status: UnknownError
+signer: CN="WDKTestCert runneradmin,134402239538508919"
+Dev-signing the driver package with installer\sign-dev.ps1 (explicit -PackageDir)...
+Creating self-signed code-signing certificate: CN=DesktopSplitter Development
+Creating self-signed code-signing certificate: CN=DesktopSplitter Development
+Created certificate: 0CB2E71C4B39C0CEA6F0D62D1B72AA4DDE6DAD26
+Created certificate: 0CB2E71C4B39C0CEA6F0D62D1B72AA4DDE6DAD26
+Importing certificate into LocalMachine\Root
+Importing certificate into LocalMachine\Root
+Importing certificate into LocalMachine\TrustedPublisher
+Importing certificate into LocalMachine\TrustedPublisher
+signtool: C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\signtool.exe
+signtool: C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\signtool.exe
+package : D:\a\DesktopSplitter\DesktopSplitter\driver\x64\Release\DesktopSplitterVdd
+package : D:\a\DesktopSplitter\DesktopSplitter\driver\x64\Release\DesktopSplitterVdd
+Signing D:\a\DesktopSplitter\DesktopSplitter\driver\x64\Release\DesktopSplitterVdd\DesktopSplitterVdd.dll
+Signing D:\a\DesktopSplitter\DesktopSplitter\driver\x64\Release\DesktopSplitterVdd\DesktopSplitterVdd.dll
+The following certificate was selected:
+    Issued to: DesktopSplitter Development
+
+    Issued by: DesktopSplitter Development
+
+    Expires:   Thu Nov 27 03:32:41 2031
+
+    SHA1 hash: 0CB2E71C4B39C0CEA6F0D62D1B72AA4DDE6DAD26
+
+
+Done Adding Additional Store
+Successfully signed: D:\a\DesktopSplitter\DesktopSplitter\driver\x64\Release\DesktopSplitterVdd\DesktopSplitterVdd.dll
+
+
+Number of files successfully Signed: 1
+
+Number of warnings: 0
+
+Number of errors: 0
+
+Signing D:\a\DesktopSplitter\DesktopSplitter\driver\x64\Release\DesktopSplitterVdd\DesktopSplitterVdd.cat
+Signing D:\a\DesktopSplitter\DesktopSplitter\driver\x64\Release\DesktopSplitterVdd\DesktopSplitterVdd.cat
+The following certificate was selected:
+    Issued to: DesktopSplitter Development
+
+    Issued by: DesktopSplitter Development
+
+    Expires:   Thu Nov 27 03:32:41 2031
+
+    SHA1 hash: 0CB2E71C4B39C0CEA6F0D62D1B72AA4DDE6DAD26
+
+
+Done Adding Additional Store
+Successfully signed: D:\a\DesktopSplitter\DesktopSplitter\driver\x64\Release\DesktopSplitterVdd\desktopsplittervdd.cat
+
+
+Number of files successfully Signed: 1
+
+Number of warnings: 0
+
+Number of errors: 0
+
+
+
+Signing complete.
+Signing complete.
+
+
+No test-signing mode is required: this is a user-mode (UMDF) driver and the
+No test-signing mode is required: this is a user-mode (UMDF) driver and the
+signing certificate is now trusted machine-wide. Secure Boot can stay enabled.
+signing certificate is now trusted machine-wide. Secure Boot can stay enabled.
+If you previously enabled test signing for this driver, you can turn it off:
+If you previously enabled test signing for this driver, you can turn it off:
+    bcdedit /set testsigning off   (then reboot)
+    bcdedit /set testsigning off   (then reboot)
+
+
+Note: the certificate trust is per-machine. To ship to other machines without
+Note: the certificate trust is per-machine. To ship to other machines without
+installing a certificate, use Microsoft attestation signing (docs/BUILDING.md).
+installing a certificate, use Microsoft attestation signing (docs/BUILDING.md).
+sign-dev completed
+catalog signature after sign-dev: Valid
+signer: CN=DesktopSplitter Development
+
+########## BUILD setup (DesktopSplitterSetup) ##########
+>> setup : C:\Program Files\Microsoft Visual Studio\2022\Enterprise\MSBuild\Current\Bin\amd64\MSBuild.exe installer\setup\DesktopSplitterSetup.vcxproj /p:Configuration=Release /p:Platform=x64 /v:m /nologo
+<< setup exit code: 0
+
+########## SELF-TEST (sabotaged WUDFRD.inf, silent install) ##########
+SELF-TEST: WUDFRD.inf hidden (simulating the target PC)
+SELF-TEST: setup exit code = 0
+SELF-TEST: WUDFRD.inf restored by the installer
+SELF-TEST: device PNPClass=Display Status=OK ConfigError=0 DeviceID=ROOT\DISPLAY\0000
+SELF-TEST: PASSED - driver bound on a machine missing WUDFRD.inf
+SPLIT-TEST: applying a 2-way split through the real driver...
+D:\a\DesktopSplitter\DesktopSplitter\ci\test-split\Program.cs(144,30): warning CA1416: This call site is reachable on all platforms. 'WindowsIdentity.GetCurrent()' is only supported on: 'windows'. (https://learn.microsoft.com/dotnet/fundamentals/code-analysis/quality-rules/ca1416) [D:\a\DesktopSplitter\DesktopSplitter\ci\test-split\test-split.csproj]
+D:\a\DesktopSplitter\DesktopSplitter\ci\test-split\Program.cs(145,16): warning CA1416: This call site is reachable on all platforms. 'WindowsPrincipal.IsInRole(WindowsBuiltInRole)' is only supported on: 'windows'. (https://learn.microsoft.com/dotnet/fundamentals/code-analysis/quality-rules/ca1416) [D:\a\DesktopSplitter\DesktopSplitter\ci\test-split\test-split.csproj]
+D:\a\DesktopSplitter\DesktopSplitter\ci\test-split\Program.cs(145,16): warning CA1416: This call site is reachable on all platforms. 'WindowsPrincipal' is only supported on: 'windows'. (https://learn.microsoft.com/dotnet/fundamentals/code-analysis/quality-rules/ca1416) [D:\a\DesktopSplitter\DesktopSplitter\ci\test-split\test-split.csproj]
+D:\a\DesktopSplitter\DesktopSplitter\ci\test-split\Program.cs(145,56): warning CA1416: This call site is reachable on all platforms. 'WindowsBuiltInRole.Administrator' is only supported on: 'windows'. (https://learn.microsoft.com/dotnet/fundamentals/code-analysis/quality-rules/ca1416) [D:\a\DesktopSplitter\DesktopSplitter\ci\test-split\test-split.csproj]
+SPLIT-TEST: baseline driver status: adapterReady=1 active=0 lastErrorStage=0 lastError=0x00000000
+SPLIT-TEST: baseline driver=0 allPaths=17 activePaths=1
+SPLIT-TEST: SET_CONFIG sent (2 monitors 1920x1080@60).
+SPLIT-TEST: driver=2 all=+0 active=+2
+SPLIT-TEST: verdict driver status: adapterReady=1 active=2 lastErrorStage=0 lastError=0x00000000
+SPLIT-TEST: PASSED — driver=2 all=+0 active=+2.
+SPLIT-TEST: reverted driver status: adapterReady=1 active=0 lastErrorStage=0 lastError=0x00000000
+SPLIT-TEST: reverted: driver=0 allPaths=17 activePaths=1.
+SPLIT-TEST: PASSED - 2 virtual monitors arrived and activated
+APPLY-TEST: running the real apply headlessly (DesktopSplitter.exe --self-test-apply)...
+APPLY-TEST: APPLY-SELF-TEST: headless end-to-end apply (2-way split).
+APPLY-TEST: 正在为虚拟屏分配独立显示源：目标 00000000:00000000#318767360 有 1 条候选路径、目标 00000000:00000000#352321793 有 2 条候选路径。
+APPLY-TEST:   Windows 已接受独立显示路径：00000000:00000000#318767360 → 源 00000000:00000000#1、00000000:00000000#352321793 → 源 00000000:00000000#2。
+APPLY-TEST: APPLY-SELF-TEST: two virtual targets cloned onto DISPLAY1 -> independent sources PASS.
+APPLY-TEST: 正在为虚拟屏分配独立显示源：目标 00000000:00000000#318767360 有 0 条候选路径、目标 00000000:00000000#352321793 有 0 条候选路径。筛选前：00000000:00000000#318767360 ← 00000000:00000000#0 \\.\DISPLAY1 可用=True 活动=True 源已占用=True；00000000:00000000#352321793 ← 00000000:00000000#0 \\.\DISPLAY1 可用=True 活动=True 源已占用=True。其他已连接或活动的目标：00000000:00000000#10。
+APPLY-TEST:   请求 Windows 切换到扩展桌面，SetDisplayConfig(EXTEND) 返回 0。
+APPLY-TEST:   恢复原物理屏配置，Win32 返回 0。
+APPLY-TEST: APPLY-SELF-TEST: zero free sources -> system EXTEND, readback and panel rollback PASS.
+APPLY-TEST: APPLY-SELF-TEST: refresh rounding ok (60020->60000, 164999->165000, 64000->64000).
+APPLY-TEST: APPLY-SELF-TEST: physical \\.\DISPLAY1 (HyperVMonitor) 1024x768 at (0,0).
+APPLY-TEST: APPLY-SELF-TEST: widening physical display to 1920x1080 for the split (was 1024x768).
+APPLY-TEST: APPLY-SELF-TEST: fixed virtual refresh ok (165007->60000, 32000->60000).
+APPLY-TEST: AUTO-CONFIRM-TEST: PASSED — 事件消费、延迟出画面、完整五秒、停帧与超时。
+APPLY-TEST: 当前主显示器：HyperVMonitor（\\.\DISPLAY1）——撤销时将恢复它。
+APPLY-TEST: 点应用前没有已存在的虚拟显示器。
+APPLY-TEST: 发送 IOCTL_DESKSPLIT_SET_CONFIG（0x00222400）：2 台显示器，60000 mHz（虚拟显示器固定 60Hz；物理屏实测 64000 mHz）…… 世代 1。
+APPLY-TEST: 等待 2 台虚拟显示器出现（最多 15 秒）……
+APPLY-TEST:   找到 DeskSplit 1（目标 00000000:003B91EC#256，路径 \\.\DISPLAY2）  [DSP product=0x0000 serial=0xD5000005]
+APPLY-TEST:   找到 DeskSplit 2（目标 00000000:003B91EC#257，路径 \\.\DISPLAY3）  [DSP product=0x0001 serial=0xD5000006]
+APPLY-TEST: 已按 EDID 序列号（驱动显示器索引）把分区映射到虚拟显示器。
+APPLY-TEST:   分区 1 -> 目标 00000000:003B91EC#256（\\.\DISPLAY2）（序列号 0xD5000005，产品代码 0x0000）
+APPLY-TEST:   分区 2 -> 目标 00000000:003B91EC#257（\\.\DISPLAY3）（序列号 0xD5000006，产品代码 0x0001）
+APPLY-TEST: 正在虚拟桌面中排列虚拟显示器……
+APPLY-TEST:   \\.\DISPLAY2：960x1080，位于 (0,0)   <-- 主显示器
+APPLY-TEST:   \\.\DISPLAY1：1024x768，位于 (-1024,0)
+APPLY-TEST:   \\.\DISPLAY3：960x1080，位于 (960,0)
+APPLY-TEST: 物理显示器上的分区矩形：[1] 512x768+0+0  [2] 512x768+512+0
+APPLY-TEST: 已写入 C:\ProgramData\DesktopSplitter\config.json
+APPLY-TEST: 已启动 dscomp.exe（pid 4712）。
+APPLY-TEST: 已保存 C:\Users\runneradmin\AppData\Roaming\DesktopSplitter\settings.json
+APPLY-TEST: APPLY-SELF-TEST: Apply() returned without throwing.
+APPLY-TEST: APPLY-SELF-TEST: topology segment 1 present and active: ok
+APPLY-TEST: APPLY-SELF-TEST: topology segment 2 present and active: ok
+APPLY-TEST: APPLY-SELF-TEST: topology segment 1 is primary: ok
+APPLY-TEST: APPLY-SELF-TEST: topology segment 1 at (0,0), actual (0,0): ok
+APPLY-TEST: APPLY-SELF-TEST: topology segment 1 is 960x1080, actual 960x1080: ok
+APPLY-TEST: APPLY-SELF-TEST: topology segment 2 at (960,0), actual (960,0): ok
+APPLY-TEST: APPLY-SELF-TEST: topology segment 2 is 960x1080, actual 960x1080: ok
+APPLY-TEST: APPLY-SELF-TEST: topology physical moved left, actual (-1024,0): ok
+APPLY-TEST: APPLY-SELF-TEST: ARRANGE-PASSED
+APPLY-TEST: 正在停止合成器……
+APPLY-TEST: 无法打开 Global\DeskSplitCompositorStop；改用 WM_CLOSE。
+APPLY-TEST: 合成器（pid 4712）未在超时时间内退出——正在终止它。
+APPLY-TEST: 合成器已停止。
+APPLY-TEST: 正在把 HyperVMonitor (\\.\DISPLAY1) [分屏前的主显示器] 设为主显示器——按 (1024,0) 重新定位全部 3 台显示器：
+APPLY-TEST:   \\.\DISPLAY1：1024x768，位于 (0,0)   <-- 主显示器
+APPLY-TEST:   \\.\DISPLAY2：960x1080，位于 (1024,0)
+APPLY-TEST:   \\.\DISPLAY3：960x1080，位于 (1984,0)
+APPLY-TEST: 发送 IOCTL_DESKSPLIT_SET_CONFIG，MonitorCount = 0……
+APPLY-TEST: 已撤销——虚拟显示器已移除。
+APPLY-TEST: APPLY-SELF-TEST: REVERT-PASSED (no virtual monitors remain)
+APPLY-TEST: INACTIVE-REPRO: test generation 2 (both creates use it).
+APPLY-TEST: 点应用前没有已存在的虚拟显示器。
+APPLY-TEST: 发送 IOCTL_DESKSPLIT_SET_CONFIG（0x00222400）：2 台显示器，60000 mHz（虚拟显示器固定 60Hz；物理屏实测 64000 mHz）…… 世代 2。
+APPLY-TEST: 等待 2 台虚拟显示器出现（最多 15 秒）……
+APPLY-TEST:   找到 DeskSplit 1（目标 00000000:003B91EC#256，路径 \\.\DISPLAY2）  [DSP product=0x0000 serial=0xD5000009]  [路径未激活]
+APPLY-TEST:   找到 DeskSplit 2（目标 00000000:003B91EC#257，路径 \\.\DISPLAY2）  [DSP product=0x0001 serial=0xD500000A]  [路径未激活]
+APPLY-TEST: 已按 EDID 序列号（驱动显示器索引）把分区映射到虚拟显示器。
+APPLY-TEST:   分区 1 -> 目标 00000000:003B91EC#256（\\.\DISPLAY2）（序列号 0xD5000009，产品代码 0x0000）
+APPLY-TEST:   分区 2 -> 目标 00000000:003B91EC#257（\\.\DISPLAY2）（序列号 0xD500000A，产品代码 0x0001）
+APPLY-TEST: INACTIVE-REPRO: \\.\DISPLAY2 已激活（距等待开始 0.0 秒）。
+APPLY-TEST: INACTIVE-REPRO: first create arrived active, as expected on a fresh machine.
+APPLY-TEST: SetDisplayConfig 已切到仅内屏（拓扑 INTERNAL），虚拟显示器应已断开。
+APPLY-TEST: INACTIVE-REPRO: disconnected — both monitors inactive.
+APPLY-TEST: 正在停止合成器……
+APPLY-TEST: 合成器未在运行。
+APPLY-TEST: 合成器已停止。
+APPLY-TEST: HyperVMonitor (\\.\DISPLAY1) [分屏前的主显示器] 已经是主显示器。
+APPLY-TEST: 发送 IOCTL_DESKSPLIT_SET_CONFIG，MonitorCount = 0……
+APPLY-TEST: 已撤销——虚拟显示器已移除。
+APPLY-TEST: INACTIVE-REPRO: reverted; monitors removed.
+APPLY-TEST: 点应用前没有已存在的虚拟显示器。
+APPLY-TEST: 发送 IOCTL_DESKSPLIT_SET_CONFIG（0x00222400）：2 台显示器，60000 mHz（虚拟显示器固定 60Hz；物理屏实测 64000 mHz）…… 世代 2。
+APPLY-TEST: 等待 2 台虚拟显示器出现（最多 15 秒）……
+APPLY-TEST: 新建的虚拟显示器 4 台，身份去重不可用（重到货的旧身份全指同一个 EDID），已按 DISPLAY 编号取最新到货的 2 台：\\.\DISPLAY4、\\.\DISPLAY5；跳过残留旧路径：\\.\DISPLAY2、\\.\DISPLAY3。
+APPLY-TEST:   找到 DeskSplit 1（目标 00000000:003B91EC#256，路径 \\.\DISPLAY4）  [DSP product=0x0000 serial=0xD5000009]  [路径未激活]
+APPLY-TEST:   找到 DeskSplit 1（目标 00000000:003B91EC#256，路径 \\.\DISPLAY5）  [DSP product=0x0000 serial=0xD5000009]  [路径未激活]
+APPLY-TEST: 警告：两台虚拟显示器报告了相同的驱动索引——回退到按枚举顺序映射。分区可能会落到错误的虚拟显示器上。
+APPLY-TEST: INACTIVE-REPRO: re-arrived monitors carry generation 2, 2 (expected 2).
+APPLY-TEST: INACTIVE-REPRO: inactive state confirmed — re-arrived generation 2 monitors stayed inactive for 15 s.
+APPLY-TEST:   \\.\DISPLAY4：在 64Hz 下被拒绝（模式不受支持）；不指定刷新率重试。
+APPLY-TEST:   \\.\DISPLAY4：960x1080，位于 (0,0)   <-- 主显示器
+APPLY-TEST:   \\.\DISPLAY1：1024x768，位于 (-1024,0)
+APPLY-TEST:   \\.\DISPLAY5：在 64Hz 下被拒绝（模式不受支持）；不指定刷新率重试。
+APPLY-TEST:   \\.\DISPLAY5：960x1080，位于 (960,0)
+APPLY-TEST: INACTIVE-REPRO: NOT-REPRODUCED — old arrange SUCCEEDED on inactive monitors.
+APPLY-TEST: 正在停止合成器……
+APPLY-TEST: 合成器未在运行。
+APPLY-TEST: 合成器已停止。
+APPLY-TEST: HyperVMonitor (\\.\DISPLAY1) [分屏前的主显示器] 已经是主显示器。
+APPLY-TEST: 发送 IOCTL_DESKSPLIT_SET_CONFIG，MonitorCount = 0……
+APPLY-TEST: 已撤销——虚拟显示器已移除。
+APPLY-TEST: 当前主显示器：HyperVMonitor（\\.\DISPLAY1）——撤销时将恢复它。
+APPLY-TEST: 点应用前没有已存在的虚拟显示器。
+APPLY-TEST: 发送 IOCTL_DESKSPLIT_SET_CONFIG（0x00222400）：2 台显示器，60000 mHz（虚拟显示器固定 60Hz；物理屏实测 64000 mHz）…… 世代 3。
+APPLY-TEST: 等待 2 台虚拟显示器出现（最多 15 秒）……
+APPLY-TEST:   找到 DeskSplit 1（目标 00000000:003B91EC#256，路径 \\.\DISPLAY2）  [DSP product=0x0000 serial=0xD500000D]  [路径未激活]
+APPLY-TEST:   找到 DeskSplit 2（目标 00000000:003B91EC#257，路径 \\.\DISPLAY2）  [DSP product=0x0001 serial=0xD500000E]  [路径未激活]
+APPLY-TEST: 已按 EDID 序列号（驱动显示器索引）把分区映射到虚拟显示器。
+APPLY-TEST:   分区 1 -> 目标 00000000:003B91EC#256（\\.\DISPLAY2）（序列号 0xD500000D，产品代码 0x0000）
+APPLY-TEST:   分区 2 -> 目标 00000000:003B91EC#257（\\.\DISPLAY2）（序列号 0xD500000E，产品代码 0x0001）
+APPLY-TEST: 正在虚拟桌面中排列虚拟显示器……
+APPLY-TEST:   \\.\DISPLAY2：960x1080，位于 (0,0)   <-- 主显示器
+APPLY-TEST:   \\.\DISPLAY1：1024x768，位于 (-1024,0)
+APPLY-TEST:   \\.\DISPLAY3：960x1080，位于 (960,0)
+APPLY-TEST: 物理显示器上的分区矩形：[1] 512x768+0+0  [2] 512x768+512+0
+APPLY-TEST: 已写入 C:\ProgramData\DesktopSplitter\config.json
+APPLY-TEST: 已启动 dscomp.exe（pid 8036）。
+APPLY-TEST: 已保存 C:\Users\runneradmin\AppData\Roaming\DesktopSplitter\settings.json
+APPLY-TEST: APPLY-SELF-TEST: topology segment 1 present and active: ok
+APPLY-TEST: APPLY-SELF-TEST: topology segment 2 present and active: ok
+APPLY-TEST: APPLY-SELF-TEST: topology segment 1 is primary: ok
+APPLY-TEST: APPLY-SELF-TEST: topology segment 1 at (0,0), actual (0,0): ok
+APPLY-TEST: APPLY-SELF-TEST: topology segment 1 is 960x1080, actual 960x1080: ok
+APPLY-TEST: APPLY-SELF-TEST: topology segment 2 at (960,0), actual (960,0): ok
+APPLY-TEST: APPLY-SELF-TEST: topology segment 2 is 960x1080, actual 960x1080: ok
+APPLY-TEST: APPLY-SELF-TEST: topology physical moved left, actual (-1024,0): ok
+APPLY-TEST: INACTIVE-REPRO: warning — fresh-generation monitors arrived INACTIVE (see arrival lines above).
+APPLY-TEST: INACTIVE-REPRO: ROTATION-PASSED — fresh generation arranged cleanly.
+APPLY-TEST: 正在停止合成器……
+APPLY-TEST: 无法打开 Global\DeskSplitCompositorStop；改用 WM_CLOSE。
+APPLY-TEST: 合成器（pid 8036）未在超时时间内退出——正在终止它。
+APPLY-TEST: 合成器已停止。
+APPLY-TEST: 正在把 HyperVMonitor (\\.\DISPLAY1) [分屏前的主显示器] 设为主显示器——按 (1024,0) 重新定位全部 3 台显示器：
+APPLY-TEST:   \\.\DISPLAY1：1024x768，位于 (0,0)   <-- 主显示器
+APPLY-TEST:   \\.\DISPLAY2：960x1080，位于 (1024,0)
+APPLY-TEST:   \\.\DISPLAY3：960x1080，位于 (1984,0)
+APPLY-TEST: 发送 IOCTL_DESKSPLIT_SET_CONFIG，MonitorCount = 0……
+APPLY-TEST: 已撤销——虚拟显示器已移除。
+APPLY-TEST: INACTIVE-REPRO: final revert done, no virtual monitors remain.
+APPLY-TEST: SDC-FALLBACK-TEST: 强制 60000 mHz 创建 + SetDisplayConfig 兜底排列验证。
+APPLY-TEST: 点应用前没有已存在的虚拟显示器。
+APPLY-TEST: 发送 IOCTL_DESKSPLIT_SET_CONFIG（0x00222400）：2 台显示器，60000 mHz（虚拟显示器固定 60Hz；物理屏实测 60000 mHz）…… 世代 4。
+APPLY-TEST: 等待 2 台虚拟显示器出现（最多 15 秒）……
+APPLY-TEST:   找到 DeskSplit 1（目标 00000000:003B91EC#256，路径 \\.\DISPLAY2）  [DSP product=0x0000 serial=0xD5000011]  [路径未激活]
+APPLY-TEST:   找到 DeskSplit 2（目标 00000000:003B91EC#257，路径 \\.\DISPLAY2）  [DSP product=0x0001 serial=0xD5000012]  [路径未激活]
+APPLY-TEST: 已按 EDID 序列号（驱动显示器索引）把分区映射到虚拟显示器。
+APPLY-TEST:   分区 1 -> 目标 00000000:003B91EC#256（\\.\DISPLAY2）（序列号 0xD5000011，产品代码 0x0000）
+APPLY-TEST:   分区 2 -> 目标 00000000:003B91EC#257（\\.\DISPLAY2）（序列号 0xD5000012，产品代码 0x0001）
+APPLY-TEST:   \\.\DISPLAY1：1024x768，位于 (-1024,0)
+APPLY-TEST:   \\.\DISPLAY2：960x1080，位于 (0,0)   <-- 主显示器
+APPLY-TEST:   \\.\DISPLAY3：960x1080，位于 (960,0)
+APPLY-TEST: APPLY-SELF-TEST: topology segment 1 present and active: ok
+APPLY-TEST: APPLY-SELF-TEST: topology segment 2 present and active: ok
+APPLY-TEST: APPLY-SELF-TEST: topology segment 1 is primary: ok
+APPLY-TEST: APPLY-SELF-TEST: topology segment 1 at (0,0), actual (0,0): ok
+APPLY-TEST: APPLY-SELF-TEST: topology segment 1 is 960x1080, actual 960x1080: ok
+APPLY-TEST: APPLY-SELF-TEST: topology segment 2 at (960,0), actual (960,0): ok
+APPLY-TEST: APPLY-SELF-TEST: topology segment 2 is 960x1080, actual 960x1080: ok
+APPLY-TEST: APPLY-SELF-TEST: topology physical moved left, actual (-1024,0): ok
+APPLY-TEST: SDC-FALLBACK-TEST: PASSED — 60000 mHz + SetDisplayConfig 兜底排列验证通过。
+APPLY-TEST: 正在停止合成器……
+APPLY-TEST: 合成器未在运行。
+APPLY-TEST: 合成器已停止。
+APPLY-TEST: 正在把 HyperVMonitor (\\.\DISPLAY1) [分屏前的主显示器] 设为主显示器——按 (1024,0) 重新定位全部 3 台显示器：
+APPLY-TEST:   \\.\DISPLAY1：1024x768，位于 (0,0)   <-- 主显示器
+APPLY-TEST:   \\.\DISPLAY2：960x1080，位于 (1024,0)
+APPLY-TEST:   \\.\DISPLAY3：960x1080，位于 (1984,0)
+APPLY-TEST: 发送 IOCTL_DESKSPLIT_SET_CONFIG，MonitorCount = 0……
+APPLY-TEST: 已撤销——虚拟显示器已移除。
+APPLY-TEST: SDC-FALLBACK-TEST: 已撤销，虚拟显示器已移除。
+APPLY-TEST: APPLY-SELF-TEST: physical display mode restored.
+APPLY-TEST: APPLY-SELF-TEST: RESULT arrange=PASS inactive-repro=FAIL rotation=PASS sdc-fallback=PASS auto-confirm=PASS revert=PASS
+APPLY-TEST: app exit code = 0
+APPLY-TEST: PASSED - real apply (arrange + rotation + sdc-fallback + revert) works; inactive-repro reported separately (not gated)
+
+########## LICENSE-TEST (license code sign/verify, trial) ##########
+D:\a\DesktopSplitter\DesktopSplitter\app\Services\LicenseService.cs(410,13): warning CA1416: This call site is reachable on all platforms. 'RegistryKey.SetValue(string?, object)' is only supported on: 'windows'. (https://learn.microsoft.com/dotnet/fundamentals/code-analysis/quality-rules/ca1416) [D:\a\DesktopSplitter\DesktopSplitter\ci\test-license\test-license.csproj]
+D:\a\DesktopSplitter\DesktopSplitter\app\Services\LicenseService.cs(397,26): warning CA1416: This call site is reachable on all platforms. 'RegistryKey.GetValue(string?)' is only supported on: 'windows'. (https://learn.microsoft.com/dotnet/fundamentals/code-analysis/quality-rules/ca1416) [D:\a\DesktopSplitter\DesktopSplitter\ci\test-license\test-license.csproj]
+D:\a\DesktopSplitter\DesktopSplitter\app\Services\LicenseService.cs(409,37): warning CA1416: This call site is reachable on all platforms. 'Registry.CurrentUser' is only supported on: 'windows'. (https://learn.microsoft.com/dotnet/fundamentals/code-analysis/quality-rules/ca1416) [D:\a\DesktopSplitter\DesktopSplitter\ci\test-license\test-license.csproj]
+D:\a\DesktopSplitter\DesktopSplitter\app\Services\LicenseService.cs(394,38): warning CA1416: This call site is reachable on all platforms. 'RegistryKey.OpenSubKey(string)' is only supported on: 'windows'. (https://learn.microsoft.com/dotnet/fundamentals/code-analysis/quality-rules/ca1416) [D:\a\DesktopSplitter\DesktopSplitter\ci\test-license\test-license.csproj]
+D:\a\DesktopSplitter\DesktopSplitter\app\Services\LicenseService.cs(396,30): warning CA1416: This call site is reachable on all platforms. 'RegistryKey.GetValue(string?)' is only supported on: 'windows'. (https://learn.microsoft.com/dotnet/fundamentals/code-analysis/quality-rules/ca1416) [D:\a\DesktopSplitter\DesktopSplitter\ci\test-license\test-license.csproj]
+D:\a\DesktopSplitter\DesktopSplitter\app\Services\LicenseService.cs(411,13): warning CA1416: This call site is reachable on all platforms. 'RegistryKey.SetValue(string?, object)' is only supported on: 'windows'. (https://learn.microsoft.com/dotnet/fundamentals/code-analysis/quality-rules/ca1416) [D:\a\DesktopSplitter\DesktopSplitter\ci\test-license\test-license.csproj]
+D:\a\DesktopSplitter\DesktopSplitter\app\Services\LicenseService.cs(409,37): warning CA1416: This call site is reachable on all platforms. 'RegistryKey.CreateSubKey(string)' is only supported on: 'windows'. (https://learn.microsoft.com/dotnet/fundamentals/code-analysis/quality-rules/ca1416) [D:\a\DesktopSplitter\DesktopSplitter\ci\test-license\test-license.csproj]
+D:\a\DesktopSplitter\DesktopSplitter\app\Services\LicenseService.cs(394,38): warning CA1416: This call site is reachable on all platforms. 'Registry.CurrentUser' is only supported on: 'windows'. (https://learn.microsoft.com/dotnet/fundamentals/code-analysis/quality-rules/ca1416) [D:\a\DesktopSplitter\DesktopSplitter\ci\test-license\test-license.csproj]
+PASS python-generated code verifies (cross-language)
+PASS python-generated code expiry reads back
+PASS c# sign/verify round-trip
+PASS tampered code rejected
+PASS wrong MAC rejected
+PASS expired code rejected
+PASS permanent code valid
+PASS malformed code rejected
+PASS pasted code with whitespace accepted
+PASS first launch starts a 60-day trial
+PASS trial status text
+LICENSE-TEST: all checks passed
+LICENSE-TEST: PASSED
+
+########## RESULT ##########
+Setup exe ready: DesktopSplitterSetup-0.6.14.exe (139.7 MB)
+DesktopSplitter ==============================
+
+Windows  DesktopSplitterVdd.inf           2498   DesktopSplitterVdd.dll          69024   DesktopSplitterVdd.cat           2675   DesktopSplitter.exe         145348407   dscomp.exe                     233984   devcreate.exe                  147456   edidoverride.exe               383488   compositor-README.md            23208
+  WinVerifyTrust 0x00000000 - ?????????????????
+        SHA-1
+
+verify exit code: 0
+**********************
+PowerShell transcript end
+End time: 20261127033411
+**********************
+
+########## STEP LOG: compositor (last 300 lines) ##########
+
+  Capture.cpp
+  Config.cpp
+  CursorConfine.cpp
+  Json.cpp
+  Log.cpp
+  Main.cpp
+  MonitorUtil.cpp
+  Renderer.cpp
+  SessionWatcher.cpp
+  SpecializedPresenter.cpp
+  WindowPresenter.cpp
+  WindowRescuer.cpp
+  Generating code
+  Previous IPDB not found, fall back to full compilation.
+  All 3513 functions were compiled because no usable IPDB/IOBJ from previous compilation was found.
+  Finished generating code
+  dscomp.vcxproj -> D:\a\DesktopSplitter\DesktopSplitter\compositor\build\x64\Release\dscomp.exe
+
+########## STEP LOG: devcreate (last 300 lines) ##########
+
+  devcreate.cpp
+  Generating code
+  Previous IPDB not found, fall back to full compilation.
+  All 21 functions were compiled because no usable IPDB/IOBJ from previous compilation was found.
+  Finished generating code
+  devcreate.vcxproj -> D:\a\DesktopSplitter\DesktopSplitter\installer\devcreate\bin\x64\Release\devcreate.exe
+
+########## STEP LOG: edidoverride (last 300 lines) ##########
+
+  Guard.cpp
+  Main.cpp
+  Generating Code...
+  edidoverride.vcxproj -> D:\a\DesktopSplitter\DesktopSplitter\installer\edid-override\build\x64\Release\edidoverride.exe
+
+########## STEP LOG: app (last 300 lines) ##########
+  Determining projects to restore...
+  Restored D:\a\DesktopSplitter\DesktopSplitter\app\DesktopSplitter.csproj (in 9.73 sec).
+  DesktopSplitter -> D:\a\DesktopSplitter\DesktopSplitter\app\bin\Release\net8.0-windows\DesktopSplitter.dll
+
+Build succeeded.
+    0 Warning(s)
+    0 Error(s)
+
+Time Elapsed 00:00:25.97
+
+########## STEP LOG: driver (last 300 lines) ##########
+
+  Building 'DesktopSplitterVdd' with toolset 'WindowsUserModeDriver10.0' and the 'Universal' target platform.
+  Stamping x64\Release\DesktopSplitterVdd.inf
+  Stamping [Version] section with DriverVer=11/27/2026,3.32.23.261
+  Driver.cpp
+  Edid.cpp
+  Guids.cpp
+  Timing.cpp
+  Running Code Analysis for C/C++...
+  Generating Code...
+     Creating library D:\a\DesktopSplitter\DesktopSplitter\driver\x64\Release\DesktopSplitterVdd.lib and object D:\a\DesktopSplitter\DesktopSplitter\driver\x64\Release\DesktopSplitterVdd.exp
+  DesktopSplitterVdd.vcxproj -> D:\a\DesktopSplitter\DesktopSplitter\driver\x64\Release\DesktopSplitterVdd.dll
+  Done Adding Additional Store
+  Successfully signed: D:\a\DesktopSplitter\DesktopSplitter\driver\x64\Release\DesktopSplitterVdd.dll
+  
+  Driver is 'Universal'.
+  ........................
+  Signability test complete.
+  
+  Errors:
+  None
+  
+  Warnings:
+  None
+  
+  Catalog generation complete.
+  D:\a\DesktopSplitter\DesktopSplitter\driver\x64\Release\DesktopSplitterVdd\desktopsplittervdd.cat
+  Set catalog attribute.
+  WdkVersion: 10.0.26100.0
+  Set catalog attribute.
+  WdkAssemblyVersion: 10.0.26100.4202
+  Done Adding Additional Store
+  Successfully signed: D:\a\DesktopSplitter\DesktopSplitter\driver\x64\Release\DesktopSplitterVdd\desktopsplittervdd.cat
+  
+
+########## STEP LOG: sign-dev (last 300 lines) ##########
+Creating self-signed code-signing certificate: CN=DesktopSplitter Development
+Created certificate: 0CB2E71C4B39C0CEA6F0D62D1B72AA4DDE6DAD26
+Importing certificate into LocalMachine\Root
+Importing certificate into LocalMachine\TrustedPublisher
+signtool: C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\signtool.exe
+package : D:\a\DesktopSplitter\DesktopSplitter\driver\x64\Release\DesktopSplitterVdd
+Signing D:\a\DesktopSplitter\DesktopSplitter\driver\x64\Release\DesktopSplitterVdd\DesktopSplitterVdd.dll
+The following certificate was selected:
+    Issued to: DesktopSplitter Development
+
+    Issued by: DesktopSplitter Development
+
+    Expires:   Thu Nov 27 03:32:41 2031
+
+    SHA1 hash: 0CB2E71C4B39C0CEA6F0D62D1B72AA4DDE6DAD26
+
+
+Done Adding Additional Store
+Successfully signed: D:\a\DesktopSplitter\DesktopSplitter\driver\x64\Release\DesktopSplitterVdd\DesktopSplitterVdd.dll
+
+
+Number of files successfully Signed: 1
+
+Number of warnings: 0
+
+Number of errors: 0
+
+Signing D:\a\DesktopSplitter\DesktopSplitter\driver\x64\Release\DesktopSplitterVdd\DesktopSplitterVdd.cat
+The following certificate was selected:
+    Issued to: DesktopSplitter Development
+
+    Issued by: DesktopSplitter Development
+
+    Expires:   Thu Nov 27 03:32:41 2031
+
+    SHA1 hash: 0CB2E71C4B39C0CEA6F0D62D1B72AA4DDE6DAD26
+
+
+Done Adding Additional Store
+Successfully signed: D:\a\DesktopSplitter\DesktopSplitter\driver\x64\Release\DesktopSplitterVdd\desktopsplittervdd.cat
+
+
+Number of files successfully Signed: 1
+
+Number of warnings: 0
+
+Number of errors: 0
+
+
+Signing complete.
+
+No test-signing mode is required: this is a user-mode (UMDF) driver and the
+signing certificate is now trusted machine-wide. Secure Boot can stay enabled.
+If you previously enabled test signing for this driver, you can turn it off:
+    bcdedit /set testsigning off   (then reboot)
+
+Note: the certificate trust is per-machine. To ship to other machines without
+installing a certificate, use Microsoft attestation signing (docs/BUILDING.md).
+
+########## STEP LOG: setup (last 300 lines) ##########
+
+  Staging driver package and product files for embedding...
+  stage-payload : catalog signature is trusted on this machine (CN=DesktopSplitter Development)
+  stage-payload : signer = CN=DesktopSplitter Development
+  stage-payload : sha1   = 0CB2E71C4B39C0CEA6F0D62D1B72AA4DDE6DAD26
+  stage-payload : staged inbox repair copy of WUDFRD.inf
+  stage-payload : publishing the control app self-contained (this takes a while)...
+        Determining projects to restore...
+        Restored D:\a\DesktopSplitter\DesktopSplitter\app\DesktopSplitter.csproj (in 1.19 sec).
+        DesktopSplitter -> D:\a\DesktopSplitter\DesktopSplitter\app\bin\Release\net8.0-windows\win-x64\DesktopSplitter.dll
+        DesktopSplitter -> D:\a\DesktopSplitter\DesktopSplitter\installer\setup\obj\apppublish\
+  stage-payload : app publish -> D:\a\DesktopSplitter\DesktopSplitter\installer\setup\obj\apppublish\DesktopSplitter.exe
+  stage-payload : staged DesktopSplitterVdd.inf          2,498 bytes
+  stage-payload : staged DesktopSplitterVdd.dll         69,024 bytes
+  stage-payload : staged DesktopSplitterVdd.cat          2,675 bytes
+  stage-payload : staged DesktopSplitter.exe       145,348,407 bytes
+  stage-payload : staged dscomp.exe                    233,984 bytes
+  stage-payload : staged devcreate.exe                 147,456 bytes
+  stage-payload : staged edidoverride.exe              383,488 bytes
+  stage-payload : staged compositor-README.md           23,208 bytes
+  stage-payload : total payload 139.4 MB
+  stage-payload : payload ready in D:\a\DesktopSplitter\DesktopSplitter\installer\setup\payload
+  Setup.cpp
+  Wizard.cpp
+  InstallEngine.cpp
+  ProductFiles.cpp
+  Edition.cpp
+  Payload.cpp
+  Trust.cpp
+  DriverPackage.cpp
+  Guids.cpp
+  DeviceNode.cpp
+  Generating code
+  Previous IPDB not found, fall back to full compilation.
+  All 147 functions were compiled because no usable IPDB/IOBJ from previous compilation was found.
+  Finished generating code
+  DesktopSplitterSetup.vcxproj -> D:\a\DesktopSplitter\DesktopSplitter\installer\setup\bin\x64\Release\DesktopSplitterSetup.exe
+
+########## PUBLISH LICENSED RELEASE ##########
+gh on PATH: yes
+GH_TOKEN present: yes
+gh release view exit=1 out=release not found
+gh release create exit=0 out=https://github.com/2227562799qq-blip/DesktopSplitter/releases/tag/v0.6.14
+gh release upload exit=0 out=
+LICENSED RELEASE: v0.6.14 now serves DesktopSplitterSetup-0.6.14.exe

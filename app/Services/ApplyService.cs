@@ -1,0 +1,1511 @@
+using System.Diagnostics;
+using System.IO;
+using System.Text.Json;
+using System.Threading;
+using DesktopSplitter.Interop;
+using DesktopSplitter.Models;
+
+namespace DesktopSplitter.Services;
+
+public sealed class ApplyException : Exception
+{
+    public ApplyException(string message) : base(message) { }
+    public ApplyException(string message, Exception inner) : base(message, inner) { }
+}
+
+/// <summary>
+/// The dialogs the display-hiding sequence needs. Every method is called from a BACKGROUND
+/// thread and blocks until the user answers, so implementations must marshal to the UI thread.
+/// </summary>
+public interface ISpecializationUi
+{
+    /// <summary>
+    /// The programmatic DisplayConfig SET was refused. Walk the user through doing the same thing
+    /// in Windows Settings ("Remove display from desktop"), polling until it takes effect.
+    /// Returns true once the monitor really is off the desktop.
+    /// </summary>
+    bool GuideManualEnable(MonitorInfo physical, SpecializationResult failure, CancellationToken ct);
+
+    /// <summary>
+    /// Keep-or-revert countdown, shown once the compositor confirms it is presenting through the
+    /// hidden display. Returns true to keep. MUST resolve to false on its own timeout — the app
+    /// is the auto-revert authority.
+    /// </summary>
+    bool ConfirmKeep(MonitorInfo physical, int timeoutSeconds, CancellationToken ct);
+
+    /// <summary>
+    /// Undoing the hide programmatically was refused too. Tell the user how to put the monitor
+    /// back themselves, and wait until they have (or they dismiss).
+    /// </summary>
+    void GuideManualDisable(MonitorInfo physical, SpecializationResult failure, CancellationToken ct);
+}
+
+/// <summary>
+/// The "Keep these display settings?" countdown, mirroring what Windows shows after a resolution
+/// change. Called from a BACKGROUND thread and blocks; returns true to keep.
+/// MUST resolve to false when the countdown lapses — that timeout is the safety net for a change
+/// that left the user unable to see or click anything.
+/// When <paramref name="compositor"/> is supplied, the countdown ALSO resolves true once the
+/// compositor proves visible output (real captured frames presented on every segment) and a
+/// short grace period passes without the user vetoing — the user never has to hunt for the
+/// dialog. A compositor that never proves visible output never auto-keeps: the lapse still
+/// resolves false, exactly as before.
+/// </summary>
+public interface IApplyConfirmer
+{
+    bool ConfirmApply(string summary, int timeoutSeconds, CancellationToken ct, Process? compositor, MonitorInfo placeOn);
+}
+
+/// <summary>
+/// The configuration that was live before an apply, so a declined change can be put back exactly.
+/// </summary>
+public sealed record AppliedSnapshot(
+    bool WasApplied,
+    string PhysicalDevice,
+    LayoutKind Layout,
+    IReadOnlyList<(int Width, int Height)> Resolutions,
+    bool HidePhysicalDisplay)
+{
+    public static readonly AppliedSnapshot None =
+        new(false, string.Empty, LayoutKind.TwoVertical, Array.Empty<(int, int)>(), false);
+}
+
+public sealed class ApplyRequest
+{
+    public required MonitorInfo Physical { get; init; }
+    public required LayoutDefinition Layout { get; init; }
+
+    /// <summary>One entry per layout segment, in layout order.</summary>
+    public required IReadOnlyList<(int Width, int Height)> Resolutions { get; init; }
+
+    /// <summary>Try to remove the physical monitor from the desktop once the split is up.</summary>
+    public bool HidePhysicalDisplay { get; init; }
+
+    /// <summary>Supplies the hiding dialogs. Without one, hiding is kept automatically.</summary>
+    public ISpecializationUi? SpecializationUi { get; init; }
+
+    /// <summary>
+    /// Show the keep-or-revert countdown after applying. Set ONLY for user-initiated applies:
+    /// startup auto-apply, crash recovery and rollback re-applies must never prompt.
+    /// </summary>
+    public bool PromptToConfirm { get; init; }
+
+    /// <summary>Supplies that countdown. Without one, no prompt is shown whatever the flag says.</summary>
+    public IApplyConfirmer? Confirmer { get; init; }
+}
+
+public sealed class ApplyResult
+{
+    public required IReadOnlyList<MonitorInfo> VirtualMonitors { get; init; }
+    public required string ConfigPath { get; init; }
+    public required int CompositorPid { get; init; }
+
+    /// <summary>True when the user declined (or ignored) the countdown and we put things back.</summary>
+    public bool RolledBack { get; init; }
+
+    /// <summary>What we rolled back to, when <see cref="RolledBack"/> is set.</summary>
+    public string RollbackDescription { get; init; } = string.Empty;
+}
+
+/// <summary>
+/// Orchestrates the full apply / revert sequence described in docs/ARCHITECTURE.md.
+/// All methods are synchronous and blocking; call them off the UI thread and pass an
+/// <see cref="IProgress{T}"/> created on the UI thread for status updates.
+/// </summary>
+public static class ApplyService
+{
+    public const int MinSegmentDimension = LayoutGeometry.MinSegmentDimension;
+    public const int MaxSegmentDimension = LayoutGeometry.MaxSegmentDimension;
+
+    private static readonly TimeSpan MonitorArrivalTimeout = TimeSpan.FromSeconds(15);
+    private static readonly TimeSpan CompositorStopTimeout = TimeSpan.FromSeconds(10);
+    private static readonly TimeSpan PollInterval = TimeSpan.FromMilliseconds(400);
+    private static readonly TimeSpan EdidMappingRetryTimeout = TimeSpan.FromSeconds(3);
+    private static readonly TimeSpan ActivePathRetryTimeout = TimeSpan.FromSeconds(3);
+
+    private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
+
+    /// <summary>%ProgramData%\DesktopSplitter</summary>
+    public static string ConfigDirectory =>
+        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "DesktopSplitter");
+
+    public static string ConfigPath => Path.Combine(ConfigDirectory, "config.json");
+
+    /// <summary>Display-generation counter: %ProgramData%\DesktopSplitter\generation.json</summary>
+    public static string GenerationPath => Path.Combine(ConfigDirectory, "generation.json");
+
+    // ------------------------------------------------------------------ apply
+
+    /// <summary>
+    /// Applies a split. The mutating pipeline runs under <see cref="DisplayOperationGate"/> so an
+    /// automatic suspend/resume cannot interleave with it; the confirmation countdown runs OUTSIDE
+    /// the gate so a UAC prompt is never made to wait on it.
+    /// </summary>
+    public static ApplyResult Apply(ApplyRequest request, IProgress<string> log, CancellationToken ct)
+    {
+        AppliedSnapshot snapshot;
+        ApplyResult applied;
+        lock (DisplayOperationGate)
+        {
+            try
+            {
+                applied = ApplyCore(request, log, ct, out snapshot);
+            }
+            catch
+            {
+                // A failure after the virtual monitors were created must not leave
+                // them live: the next attempt's wait counts only NEW monitors, so
+                // leftovers make every retry time out. Clean up only when the
+                // driver actually has live monitors, so a pre-config failure
+                // (driver missing, bad request) stays quiet.
+                bool needsCleanup = false;
+                try { needsCleanup = DriverClient.GetStatus().ActiveMonitorCount > 0; }
+                catch { /* driver gone: nothing to clean up */ }
+                if (needsCleanup)
+                {
+                    try
+                    {
+                        log.Report("应用失败，正在清理已创建的虚拟显示器……");
+                        RevertCore(log, ct, request.SpecializationUi);
+                    }
+                    catch (Exception ex)
+                    {
+                        log.Report($"清理失败的分屏时出错（已忽略）：{ex.Message}");
+                    }
+                }
+                throw;
+            }
+        }
+
+        // g. "Keep these display settings?" — only for user-initiated applies. A change that
+        //    leaves the user unable to see or click anything undoes itself when the countdown
+        //    lapses, exactly like Windows' own resolution prompt.
+        if (!request.PromptToConfirm || request.Confirmer is null) return applied;
+
+        string summary = $"在 {request.Physical.DisplayLabel} 上应用{request.Layout.Name}" +
+                         $"（{string.Join(", ", request.Resolutions.Select(r => $"{r.Width}x{r.Height}"))}）";
+
+        // Hand the confirmer the compositor process so it can auto-keep once the
+        // compositor proves visible output. A process that is already gone means
+        // the change must be rolled back.
+        Process? compositor = null;
+        try
+        {
+            compositor = Process.GetProcessById(applied.CompositorPid);
+        }
+        catch (ArgumentException)
+        {
+            log.Report($"合成器已退出（pid {applied.CompositorPid}），正在恢复之前的设置。");
+        }
+
+        bool kept;
+        try
+        {
+            kept = request.Confirmer.ConfirmApply(summary, ConfirmChangesSeconds, ct, compositor, applied.VirtualMonitors[0]);
+        }
+        catch (Exception ex)
+        {
+            log.Report($"无法完成分屏确认，正在恢复之前的设置：{ex.Message}");
+            kept = false;
+        }
+        finally
+        {
+            compositor?.Dispose();
+        }
+
+        if (kept)
+        {
+            log.Report("已保留更改。");
+            return applied;
+        }
+
+        CompositorLauncher.ReportStartupLog(log);
+        log.Report("更改未确认——正在回滚。");
+        string restored = RollBackTo(snapshot, log, CancellationToken.None, request.SpecializationUi);
+        return new ApplyResult
+        {
+            VirtualMonitors = applied.VirtualMonitors,
+            ConfigPath = applied.ConfigPath,
+            CompositorPid = applied.CompositorPid,
+            RolledBack = true,
+            RollbackDescription = restored,
+        };
+    }
+
+    /// <summary>
+    /// Rounds a refresh rate to whole hertz (in millihertz). Kept as a tested
+    /// utility: a DEVMODE can only ask for whole hertz (dmDisplayFrequency is an
+    /// integer), so a fractional rate (e.g. 60020 mHz on a 60.020 Hz panel) would
+    /// make that mode un-requestable — ChangeDisplaySettingsEx then fails with
+    /// DISP_CHANGE_BADMODE even on the no-refresh retry, because Windows still
+    /// resolves the request to 60 Hz. Production no longer rounds the physical
+    /// rate: virtual monitors now run at the fixed rate below.
+    /// </summary>
+    internal static uint RoundRefreshMillihertzToWholeHertz(uint millihertz)
+        => (uint)Math.Round(millihertz / 1000.0, MidpointRounding.AwayFromZero) * 1000u;
+
+    /// <summary>
+    /// Claims the next display-generation counter for one apply and persists it
+    /// (generation.json next to config.json / license.json). The counter only
+    /// ever increases, and it survives reboots: a generation Windows once
+    /// recorded as "disconnected" must never be stamped again, or the next
+    /// apply restores the same disconnected topology. Generation 0 is the
+    /// legacy fixed serials (0.6.6 and earlier); the first 0.6.7 apply claims 1.
+    /// </summary>
+    internal static uint ClaimNextDisplayGeneration(IProgress<string>? log = null)
+    {
+        uint last = ReadDisplayGeneration();
+        uint next = last >= DisplayConfig.DeskSplitMaxGeneration ? 1u : last + 1u;
+        if (next == 1u && last != 0)
+        {
+            log?.Report("显示器世代计数已达上限，已从 1 重新开始（旧身份可能被系统认出）。");
+        }
+        WriteDisplayGeneration(next);
+        return next;
+    }
+
+    private static uint ReadDisplayGeneration()
+    {
+        try
+        {
+            if (!File.Exists(GenerationPath)) return 0;
+            using JsonDocument doc = JsonDocument.Parse(File.ReadAllText(GenerationPath));
+            if (doc.RootElement.TryGetProperty("generation", out JsonElement element) &&
+                element.ValueKind == JsonValueKind.Number &&
+                element.TryGetUInt32(out uint value))
+            {
+                return value;
+            }
+            return 0;
+        }
+        catch
+        {
+            return 0;
+        }
+    }
+
+    private static void WriteDisplayGeneration(uint generation)
+    {
+        try
+        {
+            Directory.CreateDirectory(ConfigDirectory);
+            File.WriteAllText(GenerationPath, JsonSerializer.Serialize(new { generation }, JsonOptions));
+        }
+        catch (Exception ex) when (ex is UnauthorizedAccessException or System.Security.SecurityException)
+        {
+            throw new ApplyException(
+                $"写入 {GenerationPath} 时被拒绝访问。{Environment.NewLine}" +
+                "请以管理员身份运行一次 DesktopSplitter——它会创建 " +
+                $"{ConfigDirectory} 并授予当前用户写入权限；" +
+                "之后运行不再需要提权。", ex);
+        }
+        catch (IOException ex)
+        {
+            throw new ApplyException($"无法写入 {GenerationPath}：{ex.Message}", ex);
+        }
+    }
+
+    /// <summary>
+    /// Virtual monitors always run at a fixed 60 Hz, whatever the physical panel
+    /// reports. The driver reports this exact rate as each virtual monitor's only
+    /// mode, so it must be a rate the OS accepts on any machine: following the
+    /// physical panel (165 Hz, or a 32 Hz Generic Non-PnP panel) risks the OS
+    /// never creating display paths for the virtual monitors at all — observed
+    /// on the 32 Hz panel, where Arrival succeeded but QDC showed 0 paths in
+    /// 15 s. The compositor still paces frames to the physical panel's real
+    /// refresh (CompositorConfig.RefreshMillihertz); only the virtual mode is fixed.
+    /// </summary>
+    internal const uint VirtualRefreshMillihertz = 60000;
+
+    /// <summary>Whole-hertz form of <see cref="VirtualRefreshMillihertz"/>.</summary>
+    internal const int VirtualRefreshHz = 60;
+
+    /// <summary>
+    /// Pure config construction for one apply: one mode per segment at the fixed
+    /// virtual refresh (see <see cref="VirtualRefreshMillihertz"/>), and the
+    /// claimed generation stamped on the whole config.
+    /// </summary>
+    internal static DESKSPLIT_CONFIG BuildDriverConfig(
+        MonitorInfo physical, LayoutDefinition layout,
+        IReadOnlyList<(int Width, int Height)> resolutions, uint generation)
+    {
+        int segmentCount = layout.SegmentCount;
+        DESKSPLIT_CONFIG cfg = DriverClient.NewConfig();
+        cfg.MonitorCount = (uint)segmentCount;
+        cfg.Generation = generation;
+        uint driverRefreshMillihertz = VirtualRefreshMillihertz;
+        for (int i = 0; i < segmentCount; i++)
+        {
+            (int w, int h) = resolutions[i];
+            cfg.Monitors[i].ModeCount = 1;
+            cfg.Monitors[i].PreferredModeIndex = 0;
+            cfg.Monitors[i].Modes[0] = new DESKSPLIT_MODE
+            {
+                Width = (uint)w,
+                Height = (uint)h,
+                RefreshMillihertz = driverRefreshMillihertz,
+            };
+        }
+        return cfg;
+    }
+
+    /// <summary>
+    /// The monitor-creation half of an apply (steps a–b of ApplyCore), factored
+    /// out so the self-test can create monitors with a CHOSEN generation: the
+    /// inactive-repro phase creates the same generation twice, to prove Windows
+    /// remembers the first set as disconnected. Production always passes
+    /// <c>generationOverride: null</c> and claims a fresh generation.
+    /// <c>newestDisplayFallback</c> is repro-only: after a disconnect + revert,
+    /// re-arrived monitors can all resolve to the same EDID, so the identity
+    /// dedup in the normal wait cannot tell the new monitors from the stale
+    /// path records; the wait then identifies the new arrivals by DISPLAY
+    /// number instead (the highest numbers are the newest arrivals).
+    /// Production never passes it.
+    /// </summary>
+    internal static IReadOnlyList<MonitorInfo> CreateVirtualMonitors(
+        ApplyRequest request, IProgress<string> log, CancellationToken ct, uint? generationOverride = null,
+        bool newestDisplayFallback = false)
+    {
+        int segmentCount = request.Layout.SegmentCount;
+        uint generation = generationOverride ?? ClaimNextDisplayGeneration(log);
+
+        IReadOnlyList<MonitorInfo> existing = newestDisplayFallback
+            ? DisplayConfig.EnumerateAll().Where(m => m.IsDeskSplitVirtual).ToList()
+            : DisplayConfig.EnumerateConnectedVirtualTargets();
+        log.Report(existing.Count == 0
+            ? "点应用前没有已存在的虚拟显示器。"
+            : $"点应用前已有虚拟显示器 {existing.Count} 台：{DescribeMonitors(existing)}。");
+
+        // a. Build and send DESKSPLIT_CONFIG.
+        DESKSPLIT_CONFIG cfg = BuildDriverConfig(request.Physical, request.Layout, request.Resolutions, generation);
+        uint driverRefreshMillihertz = cfg.Monitors[0].Modes[0].RefreshMillihertz;
+        log.Report($"发送 IOCTL_DESKSPLIT_SET_CONFIG（0x{DriverClient.IOCTL_DESKSPLIT_SET_CONFIG:X8}）：" +
+                   $"{segmentCount} 台显示器，{driverRefreshMillihertz} mHz" +
+                   $"（虚拟显示器固定 60Hz；物理屏实测 {request.Physical.MaxRefreshMillihertz} mHz）…… 世代 {generation}。");
+        try
+        {
+            DriverClient.SetConfig(cfg);
+        }
+        catch (DriverNotFoundException ex)
+        {
+            throw new ApplyException(ex.Message, ex);
+        }
+        catch (DriverIoException ex)
+        {
+            throw new ApplyException(ex.Message, ex);
+        }
+
+        // b. Wait for the virtual monitors to arrive.
+        log.Report($"等待 {segmentCount} 台虚拟显示器出现（最多 {MonitorArrivalTimeout.TotalSeconds:0} 秒）……");
+        IReadOnlyList<MonitorInfo> arrived = newestDisplayFallback
+            ? WaitForVirtualMonitorsByNewestDisplay(segmentCount,
+                existing.Select(m => m.DeviceName).ToHashSet(StringComparer.OrdinalIgnoreCase), log, ct)
+            : WaitForVirtualMonitors(segmentCount, generation,
+                existing.Select(m => m.DisplayTarget).ToHashSet(), ct);
+        foreach (MonitorInfo m in arrived)
+        {
+            log.Report($"  找到 {m.FriendlyName}（目标 {m.DisplayTarget}，路径 {DisplayPathName(m)}）" +
+                       (m.Edid is null ? "  [无 EDID]" : $"  [{m.Edid}]") +
+                       (m.IsActivePath ? string.Empty : "  [路径未激活]"));
+        }
+
+        // Map segment i -> the monitor the driver created as DESKSPLIT_CONFIG.Monitors[i],
+        // identified by the EDID serial the driver stamps
+        // (0xD5000001 + generation * 4 + index; the index is the serial's low bits).
+        return MapSegmentsToMonitors(arrived, segmentCount, log, ct, newestDisplayFallback);
+    }
+
+    private static ApplyResult ApplyCore(
+        ApplyRequest request, IProgress<string> log, CancellationToken ct, out AppliedSnapshot snapshot)
+    {
+        ValidateRequest(request);
+
+        MonitorInfo physical = request.Physical;
+        LayoutDefinition layout = request.Layout;
+        int segmentCount = layout.SegmentCount;
+
+        // Captured BEFORE anything changes, so a declined confirmation can put it all back.
+        snapshot = CaptureAppliedSnapshot();
+
+        // 0. A compositor from a previous run must not be holding duplication handles on
+        //    monitors we are about to tear down.
+        if (CompositorLauncher.IsRunning())
+        {
+            log.Report("先停止正在运行的合成器……");
+            CompositorLauncher.StopAndWait(CompositorStopTimeout, log.Report);
+        }
+
+        IReadOnlyList<MonitorInfo> before = DisplayConfig.Enumerate();
+
+        // Remember which display was primary BEFORE we touch anything — Revert restores
+        // exactly this monitor, which is not necessarily the one being split.
+        (string previousPrimaryDevice, string previousPrimaryName) = CapturePreviousPrimary(before, log);
+
+        // a–b. Build + send DESKSPLIT_CONFIG, wait for arrival, map segments to
+        // monitors (see CreateVirtualMonitors; production claims a fresh
+        // generation every apply).
+        IReadOnlyList<MonitorInfo> virtualMonitors = CreateVirtualMonitors(request, log, ct);
+
+        // c. Arrange them contiguously to the right of the physical monitor and promote
+        //    segment 1's virtual monitor to PRIMARY, in one batch. The shell anchors the Start
+        //    menu, Alt-Tab switcher and most centred dialogs to the primary display; leaving
+        //    the physical monitor primary drew them across the whole panel, behind/around
+        //    the compositor's output instead of inside a segment.
+        //    Windows restores the layout it remembers for this set of monitors as they arrive
+        //    (typically segment 1 already primary and the physical monitor moved left of it),
+        //    so positions are computed from where the physical monitor is NOW.
+        log.Report("正在虚拟桌面中排列虚拟显示器……");
+        var desktop = PrepareVirtualDesktop(virtualMonitors, request.Resolutions, physical, log, ct);
+        IReadOnlyList<MonitorInfo> current = desktop.Monitors;
+        virtualMonitors = desktop.VirtualMonitors;
+        MonitorInfo physicalNow = current.First(m => IsSamePhysicalTarget(m, physical));
+        if (SameDevice(previousPrimaryDevice, physical.DeviceName)) previousPrimaryDevice = physicalNow.DeviceName;
+        physical = physicalNow;
+        IReadOnlyList<DisplayArranger.VirtualPlacement> placements =
+            DisplayArranger.ComputePlacements(physicalNow, layout, virtualMonitors, request.Resolutions);
+        string appliedPrimaryDevice = virtualMonitors[0].DeviceName;
+        DisplayArranger.ApplyLayout(
+            DisplayArranger.ComposeLayout(current, placements, VirtualRefreshHz, appliedPrimaryDevice),
+            log.Report);
+
+        // Use the active source for each target when writing the compositor configuration.
+        virtualMonitors = ReadActiveDesktop(virtualMonitors, log, ct).VirtualMonitors;
+
+        // d. Write %ProgramData%\DesktopSplitter\config.json.
+        // physRects mirror the editor: track sizes are normalised onto the monitor's real
+        // dimensions (last track absorbs the rounding remainder) rather than being an equal
+        // subdivision, so a dragged/typed split lands on screen exactly where it was drawn.
+        IReadOnlyList<PixelRect> physRects = LayoutGeometry.ComputePhysRects(
+            layout, physical.CurrentWidth, physical.CurrentHeight, request.Resolutions);
+        log.Report("物理显示器上的分区矩形：" +
+                   string.Join("  ", physRects.Select((r, i) => $"[{i + 1}] {r}")));
+        var compositorConfig = new CompositorConfig
+        {
+            PhysicalDevice = physical.DeviceName,
+            RefreshMillihertz = request.Physical.MaxRefreshMillihertz,
+        };
+        for (int i = 0; i < segmentCount; i++)
+        {
+            (int w, int h) = request.Resolutions[i];
+            compositorConfig.Segments.Add(new CompositorSegment
+            {
+                VirtualDevice = virtualMonitors[i].DeviceName,
+                Width = w,
+                Height = h,
+                PhysRect = CompositorRect.From(physRects[i]),
+            });
+        }
+        WriteCompositorConfig(compositorConfig);
+        log.Report($"已写入 {ConfigPath}");
+
+        // e. Optionally hide the physical monitor, then launch the compositor.
+        //    Ordering matters: the display must already be specialized when dscomp starts, and
+        //    only a NON-primary display can be specialized — which is exactly why this runs
+        //    after segment 1 was promoted to primary in step c2.
+        (Process compositor, string specializedDevice) = LaunchCompositor(request, physical.DeviceName, log, ct);
+
+        // f. Remember the settings for next launch / tray "Apply last".
+        AppSettings? previousSettings = SettingsStore.Load();
+        SettingsStore.Save(new AppSettings
+        {
+            PhysicalDevice = physical.DeviceName,
+            PhysicalFriendlyName = physical.FriendlyName,
+            Layout = layout.Kind,
+            Segments = request.Resolutions.Select(r => new SegmentSize { Width = r.Width, Height = r.Height }).ToList(),
+            PreviousPrimaryDevice = previousPrimaryDevice,
+            PreviousPrimaryFriendlyName = previousPrimaryName,
+            AppliedPrimaryDevice = appliedPrimaryDevice,
+            HidePhysicalDisplay = request.HidePhysicalDisplay,
+            SpecializedDevice = specializedDevice,
+            LastAppliedUtc = DateTime.UtcNow,
+            SplitActiveOnExit = true,
+            ApplyOnStartup = previousSettings?.ApplyOnStartup ?? false,
+            StartWithWindows = previousSettings?.StartWithWindows ?? false,
+            MinimizeToTrayOnClose = previousSettings?.MinimizeToTrayOnClose ?? true,
+            SpecializationHashes = previousSettings?.SpecializationHashes ?? new Dictionary<string, string>(),
+            SpecializationHashRecipe = previousSettings?.SpecializationHashRecipe ?? string.Empty,
+        });
+        log.Report($"已保存 {SettingsStore.FilePath}");
+
+        return new ApplyResult
+        {
+            VirtualMonitors = virtualMonitors,
+            ConfigPath = ConfigPath,
+            CompositorPid = compositor.Id,
+        };
+    }
+
+    /// <summary>
+    /// Records that no split is running. <paramref name="deliberate"/> distinguishes a user
+    /// pressing Revert (never auto-apply again) from an automatic teardown at exit.
+    /// </summary>
+    public static void MarkSplitInactive(bool deliberate)
+    {
+        try
+        {
+            AppSettings? settings = SettingsStore.Load();
+            if (settings is null) return;
+            if (!settings.SplitActiveOnExit && !deliberate) return;
+
+            settings.SplitActiveOnExit = false;
+            if (deliberate) settings.ApplyOnStartup = false;
+            SettingsStore.Save(settings);
+        }
+        catch
+        {
+            // Never let bookkeeping break a revert.
+        }
+    }
+
+    /// <summary>
+    /// Decides whether startup should re-apply the saved configuration. Auto-apply happens when
+    /// the user asked for it, or when a split was still running when we last exited — but never
+    /// after a deliberate revert, and never when a split is somehow already up.
+    /// </summary>
+    public static bool ShouldAutoApplyOnStartup(AppSettings? settings, bool splitAlreadyActive)
+    {
+        if (settings is null) return false;
+        if (splitAlreadyActive) return false;
+        if (string.IsNullOrEmpty(settings.PhysicalDevice) || settings.Segments.Count == 0) return false;
+        return settings.ApplyOnStartup || settings.SplitActiveOnExit;
+    }
+
+    // ------------------------------------------------------------------ confirm / roll back
+
+    /// <summary>Seconds the "Keep these display settings?" countdown runs before auto-reverting.</summary>
+    public const int ConfirmChangesSeconds = 15;
+
+    /// <summary>
+    /// What is live right now, so a declined apply can be put back. "Applied" means a split is
+    /// genuinely running, not merely that settings.json remembers one — a user who reverted
+    /// deliberately must not have it resurrected.
+    /// </summary>
+    public static AppliedSnapshot CaptureAppliedSnapshot()
+    {
+        AppSettings? settings = SettingsStore.Load();
+        if (settings is null || string.IsNullOrEmpty(settings.PhysicalDevice) || settings.Segments.Count == 0)
+            return AppliedSnapshot.None;
+        if (!HidingStatus.IsSplitActive())
+            return AppliedSnapshot.None;
+
+        return new AppliedSnapshot(
+            true,
+            settings.PhysicalDevice,
+            settings.Layout,
+            settings.Segments.Select(s => (s.Width, s.Height)).ToList(),
+            settings.HidePhysicalDisplay);
+    }
+
+    /// <summary>
+    /// Restores the configuration captured before the declined apply — re-applying the previous
+    /// split, or reverting completely when there was none. Never prompts (that would trap the
+    /// user in a loop of countdowns).
+    /// </summary>
+    private static string RollBackTo(
+        AppliedSnapshot snapshot, IProgress<string> log, CancellationToken ct, ISpecializationUi? ui)
+    {
+        if (!snapshot.WasApplied)
+        {
+            log.Report("此次更改之前没有已应用的分屏——完全还原。");
+            Revert(log, ct, ui);
+            return "无分屏（已完全还原）";
+        }
+
+        MonitorInfo? physical = FindLive(snapshot.PhysicalDevice);
+        LayoutDefinition layout = LayoutDefinition.FromKind(snapshot.Layout);
+
+        if (physical is null || snapshot.Resolutions.Count != layout.SegmentCount)
+        {
+            log.Report("之前的配置已失效——完全还原。");
+            Revert(log, ct, ui);
+            return "无分屏（已完全还原）";
+        }
+
+        log.Report($"正在恢复之前的配置：在 {physical.DisplayLabel} 上的{layout.Name}。");
+        Apply(new ApplyRequest
+        {
+            Physical = physical,
+            Layout = layout,
+            Resolutions = snapshot.Resolutions,
+            HidePhysicalDisplay = snapshot.HidePhysicalDisplay,
+            SpecializationUi = ui,
+            PromptToConfirm = false,
+        }, log, ct);
+
+        return $"在 {physical.DisplayLabel} 上的{layout.Name}";
+    }
+
+    // ------------------------------------------------------------------ revert
+
+    public static void Revert(IProgress<string> log, CancellationToken ct, ISpecializationUi? ui = null)
+    {
+        lock (DisplayOperationGate)
+        {
+            RevertCore(log, ct, ui);
+        }
+    }
+
+    private static void RevertCore(IProgress<string> log, CancellationToken ct, ISpecializationUi? ui)
+    {
+        log.Report("正在停止合成器……");
+        bool stopped = CompositorLauncher.StopAndWait(CompositorStopTimeout, log.Report);
+        log.Report(stopped ? "合成器已停止。" : "合成器可能仍在运行。");
+
+        // Put the physical monitor back on the desktop BEFORE anything else is torn down —
+        // otherwise the primary restore and the virtual-monitor removal both operate on a
+        // desktop that is missing a display.
+        ClearSpecializationIfOurs(log, ui, ct);
+
+        // Hand primary back to a physical monitor BEFORE the virtual ones disappear. If the
+        // primary vanishes, Windows picks an arbitrary survivor and re-bases the desktop on
+        // its own terms, which scrambles window positions.
+        RestorePrimaryBeforeTeardown(log);
+
+        log.Report("发送 IOCTL_DESKSPLIT_SET_CONFIG，MonitorCount = 0……");
+        try
+        {
+            DriverClient.ClearConfig();
+        }
+        catch (DriverNotFoundException ex)
+        {
+            throw new ApplyException(ex.Message, ex);
+        }
+        catch (DriverIoException ex)
+        {
+            throw new ApplyException(ex.Message, ex);
+        }
+
+        // Best effort: give Windows a moment to retire the virtual monitors.
+        DateTime deadline = DateTime.UtcNow + TimeSpan.FromSeconds(10);
+        while (DateTime.UtcNow < deadline && !ct.IsCancellationRequested)
+        {
+            if (SafeEnumerate().All(m => !m.IsDeskSplitVirtual)) break;
+            ct.WaitHandle.WaitOne(PollInterval);
+        }
+
+        // Mark the split as deliberately off, so startup auto-apply does not resurrect it.
+        MarkSplitInactive(deliberate: true);
+
+        log.Report("已撤销——虚拟显示器已移除。");
+    }
+
+    // ------------------------------------------------------------------ display hiding
+
+    /// <summary>How long to wait for the compositor's first specialized scan-out.</summary>
+    private static readonly TimeSpan SpecializedLiveTimeout = TimeSpan.FromSeconds(15);
+
+    /// <summary>Seconds the user gets to keep the hidden state before it auto-reverts.</summary>
+    public const int SpecializationConfirmSeconds = 10;
+
+    private static MonitorInfo? FindLive(string deviceName)
+        => SafeEnumerate().FirstOrDefault(m => SameDevice(m.DeviceName, deviceName));
+
+    /// <summary>
+    /// Starts the compositor, first specializing the physical monitor when that was asked for.
+    ///
+    /// Sequence: SET specialization ON -> launch dscomp --specialized -> wait for
+    /// Global\DeskSplitSpecializedLive -> keep/revert countdown. Anything short of a confirmed
+    /// keep rolls all the way back to a plain windowed compositor, so a failure can never leave
+    /// the monitor off the desktop with nothing drawing to it.
+    /// </summary>
+    private static (Process Compositor, string SpecializedDevice) LaunchCompositor(
+        ApplyRequest request, string physicalDevice, IProgress<string> log, CancellationToken ct)
+    {
+        if (!request.HidePhysicalDisplay) return (StartPlain(log), string.Empty);
+
+        MonitorInfo? physical = FindLive(physicalDevice);
+        if (physical is null)
+        {
+            log.Report($"警告：{physicalDevice} 已消失；以普通方式启动合成器。");
+            return (StartPlain(log), string.Empty);
+        }
+
+        // Windows only allows a NON-primary display to be specialized.
+        if (physical.IsPrimary)
+        {
+            log.Report($"警告：{physical.DisplayLabel} 仍是主显示器，而 Windows 只" +
+                       "允许隐藏非主显示器。跳过隐藏。");
+            return (StartPlain(log), string.Empty);
+        }
+
+        if (!MonitorSpecialization.TryGet(physical, out SpecializationState state, out int rc))
+        {
+            log.Report($"警告：无法读取显示器专用化状态（错误 {rc}）。跳过隐藏。");
+            return (StartPlain(log), string.Empty);
+        }
+
+        if (!state.Available)
+        {
+            log.Report($"警告：{physical.DisplayLabel} 无法隐藏（GET 原始值 0x{state.RawValue:X}：" +
+                       $"monitor={state.AvailableForMonitor}，system={state.AvailableForSystem}）。跳过隐藏。");
+            return (StartPlain(log), string.Empty);
+        }
+
+        bool alreadyHidden = state.EnabledNow;
+        if (alreadyHidden)
+            log.Report($"{physical.DisplayLabel} 已不在桌面上——直接进入接管流程。");
+
+        // START THE COMPOSITOR FIRST. It polls until the display becomes specialized and then
+        // acquires it. If the display were removed from the desktop before anything was ready to
+        // scan out to it, the panel would simply go black — which is exactly what happened when
+        // this was done in the other order.
+        Process compositor = CompositorLauncher.Start(
+            CompositorLauncher.SpecializedArgument,
+            CompositorLauncher.WaitForTargetArgument, CompositorLauncher.WaitForTargetSeconds.ToString(),
+            CompositorLauncher.FrameDeadlineArgument, CompositorLauncher.FrameDeadlineSeconds.ToString());
+        log.Report($"已启动 {compositor.ProcessName}.exe {CompositorLauncher.SpecializedArgument} " +
+                   $"{CompositorLauncher.WaitForTargetArgument} {CompositorLauncher.WaitForTargetSeconds} " +
+                   $"（pid {compositor.Id}）——它正在等待接管显示器。");
+
+        if (!alreadyHidden && !SetSpecialized(physical, true, request.SpecializationUi, log, ct))
+        {
+            log.Report("显示器隐藏已取消——以窗口模式重启合成器。");
+            CompositorLauncher.StopAndWait(CompositorStopTimeout, log.Report);
+            return (StartPlain(log), string.Empty);
+        }
+
+        log.Report($"最多等待 {SpecializedLiveTimeout.TotalSeconds:0} 秒，等待 " +
+                   $"{CompositorLauncher.SpecializedLiveEventName}……");
+        CompositorLauncher.SpecializedWait wait =
+            CompositorLauncher.WaitForSpecializedLive(compositor, SpecializedLiveTimeout, ct, log.Report);
+
+        bool keep = ShouldKeepHiding(
+            wait,
+            askUser: () => request.SpecializationUi is null
+                           || request.SpecializationUi.ConfirmKeep(physical, SpecializationConfirmSeconds, ct),
+            log);
+
+        if (keep) return (compositor, physical.DeviceName);
+
+        // Roll back: stop the compositor, put the display back, restart windowed.
+        log.Report("正在回滚显示器隐藏……");
+        CompositorLauncher.StopAndWait(CompositorStopTimeout, log.Report);
+        RestoreToDesktop(physical, request.SpecializationUi, log, ct);
+
+        return (StartPlain(log), string.Empty);
+    }
+
+    /// <summary>
+    /// The keep-or-roll-back decision, isolated so it can be tested without touching a display.
+    ///
+    /// The user is only ever asked when the compositor actually confirmed it is presenting
+    /// through the hidden display. Every other outcome — no signal, or the compositor dying —
+    /// rolls back WITHOUT prompting, because in those cases the user may be looking at a blank
+    /// screen and cannot answer.
+    /// </summary>
+    public static bool ShouldKeepHiding(
+        CompositorLauncher.SpecializedWait wait, Func<bool> askUser, IProgress<string> log)
+    {
+        switch (wait)
+        {
+            case CompositorLauncher.SpecializedWait.Live:
+                log.Report("合成器已确认通过隐藏显示器输出画面——请你确认。");
+                bool keep = askUser();
+                log.Report(keep ? "保留隐藏显示器。" : "把显示器恢复到桌面。");
+                return keep;
+
+            case CompositorLauncher.SpecializedWait.CompositorExited:
+                log.Report("合成器在通过隐藏显示器输出画面之前就已停止——" +
+                           "不询问，直接回滚。");
+                return false;
+
+            default:
+                log.Report($"{SpecializedLiveTimeout.TotalSeconds:0} 秒内未收到 {CompositorLauncher.SpecializedLiveEventName} 信号" +
+                           "——视为隐藏失败，不询问，直接回滚。");
+                return false;
+        }
+    }
+
+    /// <summary>
+    /// Adds or removes a monitor from the desktop, trying the routes in order of preference:
+    ///
+    ///   1. SystemSettingsAdminFlows.exe SpecializeDisplay — what Windows itself runs. Needs a
+    ///      validated identity hash, so it is off until that has been proven on this machine.
+    ///   2. The guided Windows Settings dialog, which the user completes by hand.
+    ///
+    /// The in-process DisplayConfig type-13 SET is deliberately NOT attempted: disassembly of every
+    /// System32 binary that calls DisplayConfigSetDeviceInfo shows none of them ever builds the
+    /// public 0x138-byte packet, so it is a metadata-only definition that cannot succeed.
+    /// Returns true once the display actually reached the requested state.
+    /// </summary>
+    private static bool SetSpecialized(
+        MonitorInfo physical, bool enable, ISpecializationUi? ui, IProgress<string> log, CancellationToken ct)
+    {
+        log.Report(enable ? $"正在把 {physical.DisplayLabel} 从桌面移除……"
+                          : $"正在把 {physical.DisplayLabel} 恢复到桌面……");
+
+        AdminFlowResult admin = SystemSettingsAdminFlowsClient.TryRun(physical, enable, log, ct);
+        if (admin.Success)
+        {
+            log.Report(admin.Message);
+            return true;
+        }
+
+        if (admin.NotAttempted)
+            log.Report($"自动方式不可用：{admin.Message}");
+        else
+            log.Report("自动方式失败：" + admin.Message);
+
+        log.Report("改用 Windows 设置方式。");
+
+        if (ui is null)
+        {
+            log.Report($"请手动操作：设置 > 系统 > 显示 > 高级显示 > " +
+                       $"选择 {physical.DisplayLabel} > {(enable ? "打开" : "关闭")} " +
+                       "“将显示器从桌面移除”。");
+            return false;
+        }
+
+        // While the user works the toggle, watch Windows' own elevated helper so we can learn
+        // this monitor's identity hash and do it in one click next time.
+        using var watcher = new SpecializationCaptureWatcher(physical, log);
+        watcher.Start();
+
+        var failure = new SpecializationResult(false, 0, admin.Message);
+        bool reached;
+        if (enable)
+        {
+            reached = ui.GuideManualEnable(physical, failure, ct);
+        }
+        else
+        {
+            ui.GuideManualDisable(physical, failure, ct);
+            reached = MonitorSpecialization.TryGet(physical, out SpecializationState after, out _)
+                      && !after.EnabledNow;
+        }
+
+        SpecializeDisplayInvocation? captured = watcher.StopAndCollect();
+        if (captured is not null)
+        {
+            SpecializationHashStore.Learn(physical, captured.Hash, log);
+        }
+        else if (watcher.ElevationRequired)
+        {
+            log.Report("注意：Windows 运行了它的显示助手程序，但该程序以管理员身份运行，" +
+                       "DesktopSplitter 无法读取它的调用方式。在你做此操作时以管理员身份" +
+                       "运行一次 DesktopSplitter，它就会记住该设置，之后可以一键为你完成。");
+        }
+
+        return reached;
+    }
+
+    /// <summary>Puts a monitor back on the desktop. Never leaves the user without a way out.</summary>
+    private static void RestoreToDesktop(
+        MonitorInfo physical, ISpecializationUi? ui, IProgress<string> log, CancellationToken ct)
+    {
+        if (SetSpecialized(physical, false, ui, log, ct))
+            log.Report($"{physical.DisplayLabel} 已恢复到桌面。");
+        else
+            log.Report($"警告：{physical.DisplayLabel} 可能仍不在桌面上。");
+    }
+
+    private static Process StartPlain(IProgress<string> log)
+    {
+        Process compositor = CompositorLauncher.Start();
+        log.Report($"已启动 {compositor.ProcessName}.exe（pid {compositor.Id}）。");
+        return compositor;
+    }
+
+    /// <summary>
+    /// Puts a monitor we specialized back on the desktop. Used by Revert, by failure cleanup and
+    /// by startup recovery after a crash.
+    /// </summary>
+    public static void ClearSpecializationIfOurs(
+        IProgress<string> log, ISpecializationUi? ui = null, CancellationToken ct = default)
+    {
+        AppSettings? settings = SettingsStore.Load();
+        string device = settings?.SpecializedDevice ?? string.Empty;
+        if (string.IsNullOrEmpty(device)) return;
+
+        MonitorInfo? monitor = FindLive(device);
+        if (monitor is null)
+        {
+            log.Report($"注意：{device} 曾被 DesktopSplitter 隐藏，但已不再连接。");
+        }
+        else if (MonitorSpecialization.TryGet(monitor, out SpecializationState state, out _) && state.EnabledNow)
+        {
+            log.Report($"正在把 {monitor.DisplayLabel} 恢复到桌面……");
+            RestoreToDesktop(monitor, ui, log, ct);
+        }
+
+        if (settings is not null)
+        {
+            settings.SpecializedDevice = string.Empty;
+            try { SettingsStore.Save(settings); } catch { /* best effort */ }
+        }
+    }
+
+    /// <summary>
+    /// Called at startup: if we recorded a hidden display but no split is running, a previous
+    /// session died without cleaning up. Put the display back.
+    /// </summary>
+    public static void RecoverStaleSpecialization(IProgress<string> log)
+    {
+        AppSettings? settings = SettingsStore.Load();
+        if (settings is null || string.IsNullOrEmpty(settings.SpecializedDevice)) return;
+        if (HidingStatus.IsSplitActive()) return;
+
+        log.Report($"正在从上个会话恢复：{settings.SpecializedDevice} 之前被遗留为隐藏状态。");
+        ClearSpecializationIfOurs(log);
+    }
+
+    // ------------------------------------------------------------------ primary display
+
+    private static bool SameDevice(string? a, string? b)
+        => !string.IsNullOrEmpty(a) && !string.IsNullOrEmpty(b) &&
+           string.Equals(a, b, StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Determines which display should be restored as primary on Revert.
+    /// If a split is already active (one of our virtual monitors currently holds primary),
+    /// the value saved by the first Apply is carried forward rather than overwritten —
+    /// otherwise a second Apply would "remember" a virtual monitor as the original primary.
+    /// </summary>
+    private static (string Device, string FriendlyName) CapturePreviousPrimary(
+        IReadOnlyList<MonitorInfo> before, IProgress<string> log)
+    {
+        MonitorInfo? livePrimary = before.FirstOrDefault(m => m.IsPrimary);
+
+        if (livePrimary is not null && !livePrimary.IsDeskSplitVirtual)
+        {
+            log.Report($"当前主显示器：{livePrimary.DisplayLabel}（{livePrimary.DeviceName}）" +
+                       "——撤销时将恢复它。");
+            return (livePrimary.DeviceName, livePrimary.FriendlyName);
+        }
+
+        AppSettings? prior = SettingsStore.Load();
+        if (prior is not null && !string.IsNullOrEmpty(prior.PreviousPrimaryDevice))
+        {
+            log.Report("已有分屏处于活动状态；沿用之前保存的分屏前主显示器 " +
+                       $"{prior.PreviousPrimaryDevice}。");
+            return (prior.PreviousPrimaryDevice, prior.PreviousPrimaryFriendlyName);
+        }
+
+        MonitorInfo? fallback = before.FirstOrDefault(m => !m.IsDeskSplitVirtual);
+        if (fallback is null)
+        {
+            log.Report("警告：无法确定撤销时要恢复为主显示器的物理显示器。");
+            return (string.Empty, string.Empty);
+        }
+
+        log.Report($"没有保存的分屏前主显示器；撤销时将恢复 {fallback.DeviceName}。");
+        return (fallback.DeviceName, fallback.FriendlyName);
+    }
+
+    /// <summary>
+    /// Makes <paramref name="targetDevice"/> the primary display. Windows pins the primary at
+    /// the virtual-desktop origin, so this re-bases every monitor by the same vector — all
+    /// relative offsets, and therefore the arrangement, are preserved exactly.
+    /// Never throws: a failure here leaves a working split with the wrong primary, which is
+    /// far better than aborting the apply.
+    /// </summary>
+    /// <summary>
+    /// Serialises every display-mutating operation: Apply, Revert and the automatic
+    /// suspend/resume primary switches. Without this an automatic suspend could land in the
+    /// middle of an Apply and leave the desktop half-rearranged.
+    ///
+    /// Deliberately NOT held across the keep-or-revert countdown — a UAC prompt must not have to
+    /// wait 15 seconds for a confirmation the user may not even be able to see.
+    /// </summary>
+    public static readonly object DisplayOperationGate = new();
+
+    /// <summary>
+    /// Makes <paramref name="targetDevice"/> primary. Public so the suspend/resume watcher can
+    /// hand primary back and forth without duplicating the re-basing logic.
+    /// </summary>
+    public static bool SwitchPrimaryTo(string targetDevice, string description, IProgress<string> log)
+        => SwitchPrimary(targetDevice, description, log);
+
+    private static bool SwitchPrimary(string targetDevice, string description, IProgress<string> log)
+    {
+        if (string.IsNullOrEmpty(targetDevice))
+        {
+            log.Report("警告：主显示器切换没有目标显示器；保持不变。");
+            return false;
+        }
+
+        IReadOnlyList<MonitorInfo> current = SafeEnumerate();
+        if (current.Count == 0)
+        {
+            log.Report("警告：无法枚举显示器；主显示器保持不变。");
+            return false;
+        }
+
+        MonitorInfo? livePrimary = current.FirstOrDefault(m => m.IsPrimary);
+        if (livePrimary is not null && SameDevice(livePrimary.DeviceName, targetDevice))
+        {
+            log.Report($"{description} 已经是主显示器。");
+            return true;
+        }
+
+        IReadOnlyList<DisplayArranger.MonitorPlacement> snapshot = DisplayArranger.SnapshotLayout(current);
+        DisplayArranger.MonitorPlacement? origin =
+            snapshot.FirstOrDefault(p => SameDevice(p.DeviceName, targetDevice));
+        if (origin is null)
+        {
+            log.Report($"警告：{targetDevice} 不在当前显示器集合中；主显示器保持不变。");
+            return false;
+        }
+
+        try
+        {
+            IReadOnlyList<DisplayArranger.MonitorPlacement> rebased =
+                DisplayArranger.RebaseToPrimary(snapshot, targetDevice);
+
+            log.Report($"正在把 {description} 设为主显示器——按 ({-origin.X},{-origin.Y}) 重新定位全部 " +
+                       $"{rebased.Count} 台显示器：");
+            DisplayArranger.ApplyLayout(rebased, log.Report);
+            return true;
+        }
+        catch (DisplayArrangeException ex)
+        {
+            log.Report("警告：主显示器切换失败——" + ex.Message);
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Picks the best physical monitor to hold primary once the split is torn down and
+    /// switches to it. Preference order: the display that was primary before Apply, then the
+    /// monitor that was split, then whatever physical monitor is available.
+    /// </summary>
+    private static void RestorePrimaryBeforeTeardown(IProgress<string> log)
+    {
+        var physicalMonitors = SafeEnumerate().Where(m => !m.IsDeskSplitVirtual).ToList();
+        if (physicalMonitors.Count == 0)
+        {
+            log.Report("警告：未找到物理显示器；不调整主显示器。");
+            return;
+        }
+
+        AppSettings? settings = SettingsStore.Load();
+        MonitorInfo? target = null;
+        string why = string.Empty;
+
+        if (settings is not null)
+        {
+            target = physicalMonitors.FirstOrDefault(m => SameDevice(m.DeviceName, settings.PreviousPrimaryDevice));
+            if (target is not null) why = "分屏前的主显示器";
+
+            if (target is null && !string.IsNullOrWhiteSpace(settings.PreviousPrimaryFriendlyName))
+            {
+                target = physicalMonitors.FirstOrDefault(
+                    m => SameDevice(m.FriendlyName, settings.PreviousPrimaryFriendlyName));
+                if (target is not null) why = "分屏前的主显示器（按名称匹配）";
+            }
+
+            if (target is null)
+            {
+                target = physicalMonitors.FirstOrDefault(m => SameDevice(m.DeviceName, settings.PhysicalDevice));
+                if (target is not null) why = "被分屏的显示器；没有保存的先前主显示器";
+            }
+        }
+
+        if (target is null)
+        {
+            target = physicalMonitors.FirstOrDefault(m => m.IsPrimary) ?? physicalMonitors[0];
+            why = "第一台可用的物理显示器；没有可用的保存状态";
+        }
+
+        SwitchPrimary(target.DeviceName, $"{target.DisplayLabel} ({target.DeviceName}) [{why}]", log);
+    }
+
+    // ------------------------------------------------------------------ helpers
+
+    public static void ValidateRequest(ApplyRequest request)
+    {
+        if (request.Resolutions.Count != request.Layout.SegmentCount)
+        {
+            throw new ApplyException(
+                $"布局“{request.Layout.Name}”需要 {request.Layout.SegmentCount} 个分区分辨率，" +
+                $"实际为 {request.Resolutions.Count} 个。");
+        }
+        if (request.Layout.SegmentCount > DriverClient.DESKSPLIT_MAX_MONITORS)
+        {
+            throw new ApplyException(
+                $"布局“{request.Layout.Name}”需要 {request.Layout.SegmentCount} 台显示器，但驱动" +
+                $"最多支持 {DriverClient.DESKSPLIT_MAX_MONITORS} 台。");
+        }
+        for (int i = 0; i < request.Resolutions.Count; i++)
+        {
+            (int w, int h) = request.Resolutions[i];
+            if (w < MinSegmentDimension || w > MaxSegmentDimension ||
+                h < MinSegmentDimension || h > MaxSegmentDimension)
+            {
+                throw new ApplyException(
+                    $"分区 {i + 1} 的分辨率 {w}x{h} 超出范围 " +
+                    $"（{MinSegmentDimension}..{MaxSegmentDimension}）。");
+            }
+        }
+        if (request.Physical.IsDeskSplitVirtual)
+            throw new ApplyException("所选显示器是 DesktopSplitter 虚拟显示器；请选择一台物理显示器。");
+    }
+
+    /// <summary>
+    /// Orders the arrived virtual monitors so that index i is the monitor the driver created
+    /// from DESKSPLIT_CONFIG.Monitors[i], using the EDID serial stamped by the driver.
+    /// Keeps the arrival order if Windows has no complete EDID mapping.
+    /// </summary>
+    private static IReadOnlyList<MonitorInfo> MapSegmentsToMonitors(
+        IReadOnlyList<MonitorInfo> arrived, int segmentCount,
+        IProgress<string> log, CancellationToken ct, bool newestDisplayFallback)
+    {
+        // Windows caches a monitor's EDID under its devnode shortly after arrival; on the
+        // first read it may not be there yet. Retry with fresh enumerations (each one
+        // re-reads the EDIDs) before giving up on identity mapping.
+        DateTime deadline = DateTime.UtcNow + EdidMappingRetryTimeout;
+        string reason;
+
+        while (true)
+        {
+            if (TryMapByEdid(arrived, segmentCount, out List<MonitorInfo> mapped, out reason))
+            {
+                log.Report("已按 EDID 序列号（驱动显示器索引）把分区映射到虚拟显示器。");
+                for (int i = 0; i < mapped.Count; i++)
+                {
+                    EdidInfo edid = mapped[i].Edid!;
+                    log.Report($"  分区 {i + 1} -> 目标 {mapped[i].DisplayTarget}（{DisplayPathName(mapped[i])}）" +
+                               $"（序列号 0x{edid.SerialNumber:X8}，产品代码 0x{edid.ProductCode:X4}）");
+                    if (edid.ProductCode != i)
+                    {
+                        log.Report($"  注意：EDID 产品代码 0x{edid.ProductCode:X4} 与显示器索引 {i} 不符；" +
+                                   "以序列号为准。");
+                    }
+                }
+                return mapped;
+            }
+
+            if (DateTime.UtcNow >= deadline || ct.IsCancellationRequested) break;
+            ct.WaitHandle.WaitOne(PollInterval);
+
+            if (newestDisplayFallback)
+            {
+                var byName = SafeEnumerateAll().ToDictionary(m => m.DeviceName, StringComparer.OrdinalIgnoreCase);
+                arrived = arrived.Select(m => byName.GetValueOrDefault(m.DeviceName, m)).ToList();
+            }
+            else
+            {
+                var byTarget = SafeEnumerateConnectedVirtualTargets().ToDictionary(m => m.DisplayTarget);
+                arrived = arrived.Select(m => byTarget.GetValueOrDefault(m.DisplayTarget, m)).ToList();
+            }
+        }
+
+        log.Report($"警告：{reason}——回退到按枚举顺序映射。" +
+                   "分区可能会落到错误的虚拟显示器上。");
+        return arrived;
+    }
+
+    internal static (IReadOnlyList<MonitorInfo> Monitors, IReadOnlyList<MonitorInfo> VirtualMonitors) ReadActiveDesktop(
+        IReadOnlyList<MonitorInfo> virtualMonitors, IProgress<string> log, CancellationToken ct)
+    {
+        // Windows may publish the active path before GDI can report its name and mode.
+        DateTime deadline = DateTime.UtcNow + ActivePathRetryTimeout;
+        while (true)
+        {
+            ct.ThrowIfCancellationRequested();
+            IReadOnlyList<MonitorInfo> current = SafeEnumerate();
+            var usable = current.Where(m => m.IsDeskSplitVirtual && m.CurrentWidth > 0 && m.CurrentHeight > 0).ToList();
+            var live = virtualMonitors.Select(v => FindVirtualTarget(v, usable)).ToList();
+            if (live.All(m => m is not null) &&
+                live.Select(m => m!.DeviceName).Distinct(StringComparer.OrdinalIgnoreCase).Count() == virtualMonitors.Count)
+            {
+                var resolved = live.Select(m => m!).ToList();
+                for (int i = 0; i < resolved.Count; i++)
+                {
+                    MonitorInfo previous = virtualMonitors[i];
+                    if (!previous.IsActivePath || !SameDevice(resolved[i].DeviceName, previous.DeviceName))
+                        log.Report($"  分区 {i + 1} 的目标 {previous.DisplayTarget} 当前使用 {resolved[i].DeviceName}。");
+                }
+                return (current, resolved);
+            }
+            if (DateTime.UtcNow >= deadline)
+            {
+                int missing = live.FindIndex(m => m is null);
+                if (missing < 0) throw new ApplyException("虚拟目标仍共用同一活动显示源。");
+                throw new ApplyException(
+                    $"分区 {missing + 1} 的虚拟显示目标 {virtualMonitors[missing].DisplayTarget} 没有可用的活动路径。");
+            }
+            ct.WaitHandle.WaitOne(PollInterval);
+        }
+    }
+
+    private static MonitorInfo? FindVirtualTarget(MonitorInfo wanted, IReadOnlyList<MonitorInfo> candidates)
+    {
+        var exact = candidates.FirstOrDefault(m => m.DisplayTarget == wanted.DisplayTarget &&
+            (wanted.Edid is null || m.Edid is null || m.Edid == wanted.Edid));
+        if (exact is not null || !DisplayConfig.IsDeskSplitEdid(wanted.Edid)) return exact;
+        // A topology change can replace the adapter/target pair after arrival.
+        // Only a unique EDID from this generation may carry the segment across.
+        var matches = candidates.Where(m => m.Edid == wanted.Edid).Take(2).ToList();
+        return matches.Count == 1 ? matches[0] : null;
+    }
+
+    private static bool IsSamePhysicalTarget(MonitorInfo current, MonitorInfo original)
+        => !current.IsDeskSplitVirtual && (current.DisplayTarget == original.DisplayTarget ||
+           (!string.IsNullOrEmpty(original.MonitorDevicePath) &&
+            SameDevice(current.MonitorDevicePath, original.MonitorDevicePath)));
+
+    internal static (IReadOnlyList<MonitorInfo> Monitors, IReadOnlyList<MonitorInfo> VirtualMonitors) PrepareVirtualDesktop(
+        IReadOnlyList<MonitorInfo> monitors, IReadOnlyList<(int Width, int Height)> sizes,
+        MonitorInfo physical, IProgress<string> log, CancellationToken ct)
+    {
+        DateTime deadline = DateTime.UtcNow + MonitorArrivalTimeout;
+        string lastProblem = "等待虚拟目标就绪";
+        using var attempt = new DisplayTopology.RoutingAttempt();
+        while (DateTime.UtcNow < deadline)
+        {
+            ct.ThrowIfCancellationRequested();
+            try
+            {
+                var connected = DisplayConfig.EnumerateConnectedVirtualTargets();
+                var mapped = monitors.Select(m => FindVirtualTarget(m, connected)).ToList();
+                if (mapped.All(m => m is not null) && mapped.Select(m => m!.DisplayTarget).Distinct().Count() == monitors.Count)
+                {
+                    var targets = mapped.Select(m => m!).ToList();
+                    if (DisplayTopology.EnsureIndependentSources(targets, sizes, physical.DisplayTarget, attempt, log, ct))
+                    {
+                        var desktop = ReadActiveDesktop(targets, log, ct);
+                        if (!desktop.Monitors.Any(m => IsSamePhysicalTarget(m, physical)))
+                            throw new ApplyException("等待原物理显示器恢复到活动桌面。");
+                        attempt.RestorePanel = null;
+                        return desktop;
+                    }
+                    lastProblem = "Windows 已接受路径，等待读回独立显示源";
+                }
+                else lastProblem = $"等待原有目标或对应的 EDID 重新出现，当前目标：{DescribeMonitors(connected)}";
+            }
+            catch (Exception ex) when (ex is DisplayConfigException or DisplayArrangeException or ApplyException)
+            {
+                lastProblem = ex.Message;
+            }
+            ct.WaitHandle.WaitOne(PollInterval);
+        }
+        throw new ApplyException($"无法为每个虚拟屏建立独立桌面：{lastProblem}");
+    }
+
+    private static string DisplayPathName(MonitorInfo monitor)
+        => string.IsNullOrEmpty(monitor.DeviceName) ? "尚无 GDI 名称" : monitor.DeviceName;
+
+    private static bool TryMapByEdid(
+        IReadOnlyList<MonitorInfo> arrived, int segmentCount,
+        out List<MonitorInfo> mapped, out string reason)
+    {
+        var byIndex = new Dictionary<int, MonitorInfo>();
+        bool duplicates = false;
+
+        foreach (MonitorInfo m in arrived)
+        {
+            int index = m.DeskSplitMonitorIndex;
+            if (index < 0 || index >= segmentCount) continue;
+            if (!byIndex.TryAdd(index, m)) duplicates = true;
+        }
+
+        bool complete = !duplicates
+                        && byIndex.Count == segmentCount
+                        && Enumerable.Range(0, segmentCount).All(byIndex.ContainsKey);
+
+        if (complete)
+        {
+            mapped = Enumerable.Range(0, segmentCount).Select(i => byIndex[i]).ToList();
+            reason = string.Empty;
+            return true;
+        }
+
+        mapped = new List<MonitorInfo>();
+        reason = duplicates
+            ? "两台虚拟显示器报告了相同的驱动索引"
+            : byIndex.Count == 0
+                ? "读不到 DesktopSplitter 范围内的 EDID 序列号"
+                : $"{segmentCount} 台显示器中只有 {byIndex.Count} 台报告了可用的驱动索引";
+        return false;
+    }
+
+    /// <summary>
+    /// Counts connected targets from this generation. A new target whose EDID
+    /// has not been cached yet can still count if it was absent before the IOCTL.
+    /// </summary>
+    private static IReadOnlyList<MonitorInfo> WaitForVirtualMonitors(
+        int expected, uint generation, HashSet<DisplayConfig.Endpoint> virtualBaseline, CancellationToken ct)
+    {
+        DateTime deadline = DateTime.UtcNow + MonitorArrivalTimeout;
+        IReadOnlyList<MonitorInfo> allVirtual = Array.Empty<MonitorInfo>();
+        List<MonitorInfo> found = new();
+
+        while (DateTime.UtcNow < deadline)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            allVirtual = SafeEnumerateConnectedVirtualTargets();
+            var targets = allVirtual.Select(m => (Monitor: m, Generation: DisplayConfig.DeskSplitGenerationFromEdid(m.Edid))).ToList();
+            var stamped = targets.Where(t => t.Generation == (int)generation).Select(t => t.Monitor).ToList();
+            if (stamped.Count == expected) return stamped;
+
+            found = targets.Where(t => t.Generation == (int)generation ||
+                                       (t.Generation < 0 && !virtualBaseline.Contains(t.Monitor.DisplayTarget)))
+                .Select(t => t.Monitor).ToList();
+            if (found.Count == expected) return found;
+
+            ct.WaitHandle.WaitOne(PollInterval);
+        }
+
+        throw new ApplyException(
+            $"等待虚拟显示器超时（{MonitorArrivalTimeout.TotalSeconds:0} 秒）：" +
+            $"应有 {expected} 个目标，本次匹配到 {found.Count} 个。" +
+            $"已连接目标：{DescribeMonitors(allVirtual)}。{DriverStatusText()}");
+    }
+
+    /// <summary>
+    /// Repro-only wait: identifies the newly arrived virtual monitors by GDI
+    /// device number to reproduce the older behavior when the same generation
+    /// is created twice. Waits until at least
+    /// <paramref name="expected"/> new paths have arrived and the count has
+    /// been stable for 2 seconds (late paths still trickling in), then
+    /// returns the highest-numbered ones.
+    /// </summary>
+    private static IReadOnlyList<MonitorInfo> WaitForVirtualMonitorsByNewestDisplay(
+        int expected, HashSet<string> virtualBaseline, IProgress<string> log, CancellationToken ct)
+    {
+        DateTime started = DateTime.UtcNow;
+        DateTime deadline = started + MonitorArrivalTimeout;
+        List<MonitorInfo> found = new();
+        int preExisting = 0;
+        int lastCount = -1;
+        DateTime lastChange = started;
+
+        while (DateTime.UtcNow < deadline)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            List<MonitorInfo> allVirtual = SafeEnumerateAll()
+                .Where(m => m.IsDeskSplitVirtual)
+                .ToList();
+            found = allVirtual
+                .Where(m => !virtualBaseline.Contains(m.DeviceName))
+                .OrderBy(m => DisplayConfig.DeviceIndex(m.DeviceName))
+                .ThenBy(m => m.DeviceName, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+            preExisting = allVirtual.Count - found.Count;
+
+            if (found.Count != lastCount)
+            {
+                lastCount = found.Count;
+                lastChange = DateTime.UtcNow;
+            }
+
+            if (found.Count >= expected &&
+                DateTime.UtcNow - lastChange >= TimeSpan.FromSeconds(2))
+            {
+                var pickedNames = found
+                    .OrderByDescending(m => DisplayConfig.DeviceIndex(m.DeviceName))
+                    .Take(expected)
+                    .Select(m => m.DeviceName)
+                    .ToHashSet(StringComparer.OrdinalIgnoreCase);
+                var picked = found.Where(m => pickedNames.Contains(m.DeviceName)).ToList();
+                var skipped = found.Where(m => !pickedNames.Contains(m.DeviceName)).ToList();
+                log.Report($"新建的虚拟显示器 {found.Count} 台，身份去重不可用（重到货的旧身份全指同一个 EDID），" +
+                           $"已按 DISPLAY 编号取最新到货的 {expected} 台：{string.Join("、", picked.Select(m => m.DeviceName))}" +
+                           (skipped.Count == 0 ? "。" : $"；跳过残留旧路径：{string.Join("、", skipped.Select(m => m.DeviceName))}。"));
+                return picked;
+            }
+
+            ct.WaitHandle.WaitOne(PollInterval);
+        }
+
+        throw new ApplyException(
+            $"等待虚拟显示器超时（{MonitorArrivalTimeout.TotalSeconds:0} 秒）：" +
+            $"应有 {expected} 台，本次新建看到 {found.Count} 台" +
+            (preExisting > 0 ? $"（另有 {preExisting} 台以前留下的虚拟显示器未计入）" : "") +
+            $"：{DescribeMonitors(found)}。{DriverStatusText()}");
+    }
+
+    /// <summary>One line per monitor for the timeout message. The display-config
+    /// target id (adapter LUID + target id) is printed too: after a disconnect +
+    /// revert, re-arrived paths can all resolve to the same EDID, and the target
+    /// id is what tells whether they share one target or carry distinct ones.</summary>
+    private static string DescribeMonitors(IReadOnlyList<MonitorInfo> monitors)
+        => monitors.Count == 0
+            ? "无"
+            : string.Join("；", monitors.Select(m =>
+                $"{DisplayPathName(m)}（索引{(m.DeskSplitMonitorIndex < 0 ? "无EDID" : m.DeskSplitMonitorIndex.ToString())}" +
+                (m.Edid is null ? string.Empty : $"，{m.Edid}") +
+                $"，目标 {m.DisplayTarget}" +
+                $"，{(m.IsActivePath ? "已激活" : "未激活")}）"));
+
+    /// <summary>
+    /// Driver-side state for the timeout message. The driver is the only one
+    /// that knows whether its adapter initialised and whether its monitors
+    /// actually arrived; its own trace goes to OutputDebugString only, so
+    /// without this the failure is invisible (no event-log entry anywhere).
+    /// Best effort: if the driver cannot be reached at all, say so.
+    /// </summary>
+    private static string DriverStatusText()
+    {
+        try
+        {
+            DESKSPLIT_STATUS status = DriverClient.GetStatus();
+            string ready = status.AdapterReady != 0 ? "已就绪" : "未就绪";
+            string text = $"驱动状态：适配器{ready}，驱动内已有 {status.ActiveMonitorCount} 台虚拟显示器";
+            if (status.LastErrorStage != 0)
+            {
+                string stage = status.LastErrorStage switch
+                {
+                    1 => "适配器初始化",
+                    2 => "显示器创建",
+                    3 => "显示器到达",
+                    4 => "配置排队（适配器未就绪）",
+                    _ => $"未知阶段 {status.LastErrorStage}",
+                };
+                text += $"，最后失败在{stage}（0x{status.LastErrorNtStatus:X8}）";
+            }
+            return text + "。";
+        }
+        catch
+        {
+            return "读不到驱动状态（驱动设备未找到或无法打开）。";
+        }
+    }
+
+    private static IReadOnlyList<MonitorInfo> SafeEnumerate()
+    {
+        try { return DisplayConfig.Enumerate(); }
+        catch (DisplayConfigException) { return Array.Empty<MonitorInfo>(); }
+    }
+
+    private static IReadOnlyList<MonitorInfo> SafeEnumerateAll()
+    {
+        try { return DisplayConfig.EnumerateAll(); }
+        catch (DisplayConfigException) { return Array.Empty<MonitorInfo>(); }
+    }
+
+    private static IReadOnlyList<MonitorInfo> SafeEnumerateConnectedVirtualTargets()
+    {
+        try { return DisplayConfig.EnumerateConnectedVirtualTargets(); }
+        catch (DisplayConfigException) { return Array.Empty<MonitorInfo>(); }
+    }
+
+    /// <summary>
+    /// Writes config.json to %ProgramData%\DesktopSplitter. There is deliberately no
+    /// fallback location: the compositor's contract is a single fixed path.
+    /// </summary>
+    public static void WriteCompositorConfig(CompositorConfig config)
+    {
+        try
+        {
+            Directory.CreateDirectory(ConfigDirectory);
+            File.WriteAllText(ConfigPath, JsonSerializer.Serialize(config, JsonOptions));
+        }
+        catch (Exception ex) when (ex is UnauthorizedAccessException or System.Security.SecurityException)
+        {
+            throw new ApplyException(
+                $"写入 {ConfigPath} 时被拒绝访问。{Environment.NewLine}" +
+                "请以管理员身份运行一次 DesktopSplitter——它会创建 " +
+                $"{ConfigDirectory} 并授予当前用户写入权限；" +
+                "之后运行不再需要提权。", ex);
+        }
+        catch (IOException ex)
+        {
+            throw new ApplyException($"无法写入 {ConfigPath}：{ex.Message}", ex);
+        }
+    }
+}
+
